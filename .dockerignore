@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.gitignore
+.venv/
+.env
+.env.*
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store

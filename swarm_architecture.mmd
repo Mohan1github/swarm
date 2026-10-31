@@ -1,0 +1,58 @@
+flowchart LR
+    user["User"] --> clients["Web / desktop / CLI clients"]
+    clients --> api["FastAPI API<br/>authentication + REST"]
+    api --> assistant["Assistant conversation flow"]
+    api --> swarm["Swarm reasoning flow"]
+
+    subgraph assistant_flow["Assistant subsystem"]
+        context["Context agent<br/>recent private activity"]
+        proactive["Proactive agent<br/>opening + bounded follow-up"]
+        conversation["Conversation agent<br/>memory-aware replies"]
+        memory[("User-scoped assistant memory")]
+        activity[("User activity graph")]
+        context --> proactive
+        activity --> context
+        memory --> proactive
+        memory --> conversation
+        proactive --> memory
+        conversation --> memory
+    end
+
+    subgraph reasoning_flow["Reasoning subsystem"]
+        classifier{"Direct or staged route?"}
+        direct["Direct answer"]
+        stages["Planner → Researcher → Analyst → Critic<br/>→ Executor → Synthesizer → Corrector → Validator"]
+        gate{"Current or evidence-sensitive?"}
+        retrieval["Conditional web retrieval<br/>text-only sources"]
+        audit_gate{"Live web sources available?"}
+        evidence_audit["Claim-level evidence audit<br/>quote-checked citations"]
+        evidence_reports[("Per-user evidence reports")]
+        output_vectors[("Agent-output vectors")]
+        answer["Final answer"]
+        classifier -->|Direct| direct
+        classifier -->|Reasoning| stages
+        stages --> gate
+        gate -->|Yes| retrieval
+        retrieval --> stages
+        stages <--> output_vectors
+        direct --> answer
+        stages --> answer
+        answer --> audit_gate
+        gate -->|No| audit_gate
+        retrieval --> audit_gate
+        audit_gate -->|Yes| evidence_audit
+        audit_gate -->|No| stream
+        evidence_audit --> evidence_reports
+        evidence_audit --> stream
+    end
+
+    api --> assistant
+    api --> classifier
+    assistant --> llm["OpenAI-compatible LLM"]
+    answer --> llm
+    llm --> stream["SSE stream"]
+    evidence_audit --> llm
+    stream --> clients
+    assistant --> data[("SQLite persistence")]
+    stages --> data
+    retrieval --> data

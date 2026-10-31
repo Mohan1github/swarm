@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+swarm_auth.sqlite3*
+vector_cache.sqlite3*
+query_activity.sqlite3*
+agent_output_vectors.sqlite3*
+web_research.sqlite3*
+evidence_ledger.sqlite3*
+__pycache__/
+.pytest_cache/
