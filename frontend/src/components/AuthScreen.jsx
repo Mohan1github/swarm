@@ -88,7 +88,11 @@ export default function AuthScreen({ onLogin, onRegister }) {
 
           {error ? <div className="auth-error" role="alert">{error}</div> : null}
 
-          <button className="auth-submit" type="submit" disabled={isSubmitting}>
+          <button
+            className={`auth-submit ${isRegistering ? 'auth-submit-register' : ''}`}
+            type="submit"
+            disabled={isSubmitting}
+          >
             {isSubmitting ? 'Please wait...' : isRegistering ? 'Create account' : 'Sign in'}
           </button>
         </form>

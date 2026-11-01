@@ -1,6 +1,7 @@
 import { useCallback, useState } from 'react'
 import TypingText from './TypingText'
 import AgentOutput from './AgentOutput'
+import StreamLoader from './StreamLoader'
 import sanitizeStreamText from '../utils/sanitizeStreamText'
 
 function formatFileSize(size) {
@@ -154,7 +155,10 @@ export default function ChatMessages({ messages, error, onAssistantProgress }) {
       {visibleMessages.map(({ message, index }) => {
         const messageKey = `${message.role}-${index}`
         const isCopied = copiedMessageId === messageKey
-        const isAssistantStreaming = message.role === 'assistant' && !message.instant && index === activeAssistantIndex
+        const isAssistantStreaming = message.role === 'assistant'
+          && !message.instant
+          && !message.loading
+          && index === activeAssistantIndex
         const content = typeof message.content === 'string' && message.role === 'assistant'
           ? sanitizeStreamText(message.content)
           : message.content
@@ -182,6 +186,8 @@ export default function ChatMessages({ messages, error, onAssistantProgress }) {
                 ) : null}
                 {message.streaming ? (
                   <AgentOutput content={content} role={message.agentRole} uiData={message.uiData} />
+                ) : message.loading ? (
+                  <StreamLoader />
                 ) : isAssistantStreaming ? (
                   <TypingText
                     text={content}

@@ -78,7 +78,7 @@ export default function useSwarmStream({ token }) {
         setLatency(0)
         setMessages((previous) => {
           const last = previous[previous.length - 1]
-          const withoutPlaceholder = last?.role === 'assistant' && last.content === 'Working on it...'
+          const withoutPlaceholder = last?.role === 'assistant' && last.loading
             ? previous.slice(0, -1)
             : previous
           return [...withoutPlaceholder, {
@@ -124,7 +124,7 @@ export default function useSwarmStream({ token }) {
         setIsRunning(false)
         setMessages((previous) => {
           const last = previous[previous.length - 1]
-          return last?.role === 'assistant' && last.content === 'Working on it...'
+          return last?.role === 'assistant' && last.loading
             ? previous.slice(0, -1)
             : previous
         })
@@ -139,7 +139,7 @@ export default function useSwarmStream({ token }) {
         const finalAnswer = formatAgentOutput(payload.answer, 'synthesizer') || 'No answer generated.'
         setMessages((previous) => {
           const last = previous[previous.length - 1]
-          const withoutPlaceholder = last?.role === 'assistant' && last.content === 'Working on it...'
+          const withoutPlaceholder = last?.role === 'assistant' && last.loading
             ? previous.slice(0, -1)
             : previous
           return [...withoutPlaceholder, {
@@ -182,7 +182,7 @@ export default function useSwarmStream({ token }) {
             size,
           })),
         },
-        { role: 'assistant', content: 'Working on it...' },
+        { role: 'assistant', content: '', loading: true },
       ])
 
       const response = await fetch('/api/swarm/query/stream', {
@@ -241,7 +241,7 @@ export default function useSwarmStream({ token }) {
         setError('The stream closed before the workflow finished. Please retry.')
         setMessages((previous) => {
           const last = previous[previous.length - 1]
-          return last?.role === 'assistant' && last.content === 'Working on it...'
+          return last?.role === 'assistant' && last.loading
             ? previous.slice(0, -1)
             : previous
         })
@@ -253,7 +253,7 @@ export default function useSwarmStream({ token }) {
       setError(streamError.message || 'The workflow could not be completed.')
       setMessages((previous) => {
         const last = previous[previous.length - 1]
-        return last?.role === 'assistant' && last.content === 'Working on it...'
+        return last?.role === 'assistant' && last.loading
           ? previous.slice(0, -1)
           : previous
       })

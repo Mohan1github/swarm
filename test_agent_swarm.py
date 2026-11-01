@@ -31,6 +31,7 @@ from agents.web_data_retriever_agent import (
     _normalize_sources,
 )
 from agents.query_level_importance_finder import QueryLevelImportanceFinder
+from agents.response_summarizer_agent import ResponseSummarizerAgent
 import agents.orchestrator as orchestrator_module
 import server
 
@@ -428,6 +429,27 @@ def test_query_processing_returns_reasoned_answer():
     assert isinstance(answer, str)
     assert len(answer) > 120
     assert "coordination" in answer.lower() or "reasoning" in answer.lower()
+
+
+def test_response_summarizer_requests_clear_plain_text_output():
+    prompts = []
+
+    class PromptCheckingLLM:
+        def generate(self, prompt, max_tokens=800):
+            prompts.append(prompt)
+            return "A clear answer."
+
+    result = ResponseSummarizerAgent(PromptCheckingLLM()).summarize(
+        query="Summarize the result",
+        focus={"focus_points": ["result"]},
+        stage_outputs=[("researcher", "Evidence from the current run.")],
+        retrieved_outputs=[],
+    )
+
+    assert result == "A clear answer."
+    assert "plain text for a chat interface" in prompts[0]
+    assert "Do not use Markdown headings" in prompts[0]
+    assert "pipe characters" in prompts[0]
 
 
 def test_live_workflow_runs_each_role_stage_with_prior_context(monkeypatch):
@@ -906,6 +928,58 @@ def test_query_classifier_reports_invalid_response_after_retry():
         "stage": "query_level_importance_finder",
         "message": "The query classifier returned an invalid response after one retry. Please retry.",
     }
+
+
+def test_query_classifier_accepts_integral_json_number_and_surrounding_text():
+    class ClassifierLLM:
+        def generate(self, prompt, max_tokens=800):
+            assert max_tokens >= 256
+            return (
+                "Classification result:\n"
+                '{"route":" REASONING ","importance":4.0,"reason":"Needs research.",'
+                '"requires_web_search":false,"search_topic":"general"}\nDone.'
+            )
+
+    route = QueryLevelImportanceFinder(ClassifierLLM()).classify("Compare two research options.")
+    assert route == {
+        "decision": "reasoning",
+        "importance": 4,
+        "reason": "Needs research.",
+        "requires_web_search": False,
+        "search_topic": "general",
+    }
+
+
+def test_query_classifier_retries_empty_output_and_does_not_send_attachment_text():
+    prompts = []
+
+    class RecoveringLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, prompt, max_tokens=800):
+            prompts.append(prompt)
+            self.calls += 1
+            if self.calls == 1:
+                return None
+            return json.dumps({
+                "route": "reasoning",
+                "importance": 3,
+                "reason": "The request asks to analyze a supplied file.",
+                "requires_web_search": False,
+                "search_topic": "general",
+            })
+
+    llm = RecoveringLLM()
+    route = QueryLevelImportanceFinder(llm).classify(
+        "Analyze this file.",
+        attachment_context="PRIVATE ATTACHMENT TEXT",
+    )
+    assert llm.calls == 2
+    assert "PRIVATE ATTACHMENT TEXT" not in prompts[0]
+    assert "TEXT ATTACHMENTS PROVIDED: yes" in prompts[0]
+    assert route["decision"] == "reasoning"
+    assert route["requires_web_search"] is False
 
 
 def test_live_workflow_retries_malformed_planner_output():

@@ -119,7 +119,11 @@ export default function ChatComposer({
       {attachmentError ? <div className="attachment-error">{attachmentError}</div> : null}
       {voiceError ? <div className="attachment-error" role="status">{voiceError}</div> : null}
 
-      <form onSubmit={onSubmit} className="composer">
+      <form
+        onSubmit={onSubmit}
+        className="composer"
+        aria-busy={isRunning}
+      >
         <input
           ref={fileInput}
           className="attachment-input"
@@ -164,6 +168,7 @@ export default function ChatComposer({
             +
           </button>
           <textarea
+            className={isRunning ? 'composer-loading' : ''}
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             onKeyDown={handleKeyDown}
