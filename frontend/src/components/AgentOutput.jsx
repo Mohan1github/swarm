@@ -77,6 +77,32 @@ function SourceCards({ sources }) {
   )
 }
 
+function DocumentCards({ documents }) {
+  if (!Array.isArray(documents) || !documents.length) return null
+
+  return (
+    <section className="agent-source-output" aria-label="Supporting documents">
+      {documents.map((document, index) => (
+        <article className="agent-source-card" key={`${document.url}-${index}`}>
+          <div className="agent-source-index">
+            {document.file_type || 'Document'} {index + 1}
+          </div>
+          <a href={document.url} target="_blank" rel="noreferrer">
+            {document.title || document.url}
+          </a>
+          <div className="agent-source-meta">
+            {document.pages ? `${document.pages} pages · ` : ''}
+            Source page: <a href={document.source_url} target="_blank" rel="noreferrer">
+              {document.source_url}
+            </a>
+          </div>
+          {document.excerpt ? <p>{document.excerpt}</p> : null}
+        </article>
+      ))}
+    </section>
+  )
+}
+
 function ValidationOutput({ data, parsed }) {
   const score = data?.validation_score ?? parsed?.validation_score
   const issues = data?.issues ?? parsed?.issues
@@ -127,6 +153,9 @@ export default function AgentOutput({ content, role, uiData }) {
   const parsed = parseStructuredOutput(content)
   if (role === 'web_retriever' && uiData?.sources?.length) {
     return <SourceCards sources={uiData.sources} />
+  }
+  if (role === 'document_retriever' && uiData?.documents?.length) {
+    return <DocumentCards documents={uiData.documents} />
   }
   if (role === 'validator') {
     const validation = <ValidationOutput data={uiData} parsed={parsed} />

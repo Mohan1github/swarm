@@ -131,7 +131,7 @@ class UserActivityStore:
         insights = {
             "steps": steps,
             "action_probabilities": workflow.get("action_probabilities", {}),
-            "validation_score": workflow.get("validation_score"),
+            "validation_score": workflow.get("validation_score"), 
             "validation_issues": workflow.get("validation_issues", []),
             "answer": str(workflow.get("answer", ""))[:6000],
         }

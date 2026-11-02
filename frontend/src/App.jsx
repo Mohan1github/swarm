@@ -3,7 +3,9 @@ import './App.css'
 import ChatSidebar from './components/ChatSidebar'
 import ChatHeader from './components/ChatHeader'
 import ChatMessages from './components/ChatMessages'
+import WorkflowProgress from './components/WorkflowProgress'
 import ChatComposer from './components/ChatComposer'
+import DocumentReviewer from './components/DocumentReviewer'
 import AuthScreen from './components/AuthScreen'
 import ContextGraphPage from './components/ContextGraphPage'
 import AssistantWorkspace from './components/AssistantWorkspace'
@@ -47,6 +49,8 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
   const [attachments, setAttachments] = useState([])
   const [attachmentError, setAttachmentError] = useState('')
   const [assistantMode, setAssistantMode] = useState(false)
+  const [researchMode, setResearchMode] = useState(false)
+  const [documentReviewerOpen, setDocumentReviewerOpen] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
   const [voiceState, setVoiceState] = useState('idle')
   const [modeTransition, setModeTransition] = useState(null)
@@ -56,6 +60,10 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
     isRunning,
     steps,
     activeStage,
+    activeStageIndex,
+    stageTotal,
+    stageRoles,
+    isResearchRun,
     messages,
     selectedAgents,
     latency,
@@ -97,20 +105,20 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
   const handleAddFiles = (files) => {
     const allowedExtensions = new Set([
       'png', 'jpg', 'jpeg', 'webp', 'pdf', 'txt', 'md', 'csv', 'json', 'py',
-      'js', 'jsx', 'ts', 'tsx', 'html', 'css', 'xml', 'yaml', 'yml', 'log', 'sql', 'sh',
+      'docx', 'js', 'jsx', 'ts', 'tsx', 'html', 'css', 'xml', 'yaml', 'yml', 'log', 'sql', 'sh',
     ])
     const availableSlots = Math.max(0, 5 - attachments.length)
     const accepted = []
     const rejected = []
     let totalPayloadSize = attachments.reduce((total, { file }) => {
       const extension = file.name.split('.').pop()?.toLowerCase()
-      const isEncoded = ['png', 'jpg', 'jpeg', 'webp', 'pdf'].includes(extension)
+      const isEncoded = ['png', 'jpg', 'jpeg', 'webp', 'pdf', 'docx'].includes(extension)
       return total + (isEncoded ? Math.ceil(file.size * 4 / 3) + 64 : file.size)
     }, 0)
 
     files.forEach((file) => {
       const extension = file.name.split('.').pop()?.toLowerCase()
-      const isEncoded = ['png', 'jpg', 'jpeg', 'webp', 'pdf'].includes(extension)
+      const isEncoded = ['png', 'jpg', 'jpeg', 'webp', 'pdf', 'docx'].includes(extension)
       const payloadSize = isEncoded ? Math.ceil(file.size * 4 / 3) + 64 : file.size
       if (!allowedExtensions.has(extension)) {
         rejected.push(`${file.name}: unsupported file type`)
@@ -138,7 +146,7 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
   const handleSubmit = (event) => {
     event.preventDefault()
     const task = query.trim() || (attachments.length ? 'Analyze the attached files and photos.' : '')
-    runWorkflow(task, attachments)
+    runWorkflow(task, attachments, undefined, researchMode)
     if (task) {
       attachments.forEach(({ previewUrl }) => previewUrl && URL.revokeObjectURL(previewUrl))
       setQuery('')
@@ -148,7 +156,7 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
   }
 
   const handleVoiceSubmit = (transcript) => {
-    if (transcript.trim()) runWorkflow(transcript.trim(), [])
+    if (transcript.trim()) runWorkflow(transcript.trim(), [], undefined, researchMode)
   }
 
   const handleModeChange = (enabled) => {
@@ -245,6 +253,7 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
         latency={latency}
         validationScore={validationScore}
         isRunning={isRunning}
+        researchMode={researchMode}
         steps={steps}
         activeStage={activeStage}
         onShowHistory={() => setHistoryOpen(true)}
@@ -255,6 +264,13 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
           activePage={activePage}
           assistantMode={assistantMode}
           onAssistantModeChange={handleModeChange}
+          researchMode={researchMode}
+          onResearchModeChange={(enabled) => {
+            setResearchMode(enabled)
+            if (!enabled) setDocumentReviewerOpen(false)
+          }}
+          onOpenDocumentReviewer={() => setDocumentReviewerOpen(true)}
+          isRunning={isRunning}
           onShowContextGraph={handleShowContextGraph}
           onBackToChat={handleBackToChat}
           onLogout={onLogout}
@@ -269,7 +285,18 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
               </div>
             )}
 
-            <ChatMessages messages={hasUserMessages ? messages : []} error={error} />
+            <div className={`chat-conversation-layout ${researchMode && stageTotal ? 'workflow-running' : ''}`}>
+              <ChatMessages messages={hasUserMessages ? messages : []} error={error} />
+              {researchMode && isResearchRun && stageTotal > 0 ? (
+                <WorkflowProgress
+                  activeStage={activeStage}
+                  activeStageIndex={activeStageIndex}
+                  stageTotal={stageTotal}
+                  stageRoles={stageRoles}
+                  steps={steps}
+                />
+              ) : null}
+            </div>
 
             <ChatComposer
               query={query}
@@ -294,6 +321,13 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
 
         {activePage === 'contextGraph' ? <ContextGraphPage token={token} isRunning={isRunning} /> : null}
       </main>
+      {documentReviewerOpen && researchMode && activePage === 'chat' ? (
+        <DocumentReviewer
+          token={token}
+          initialDocuments={messages.flatMap((message) => message.supportingDocuments || [])}
+          onClose={() => setDocumentReviewerOpen(false)}
+        />
+      ) : null}
       <ChatHistoryDrawer
         token={token}
         open={historyOpen}

@@ -1,6 +1,8 @@
 export const stageOrder = [
   'planner',
   'web_retriever',
+  'image_retriever',
+  'document_retriever',
   'researcher',
   'analyst',
   'critic',
@@ -16,6 +18,8 @@ export const stageOrder = [
 export const stageLabels = {
   planner: 'Planner',
   web_retriever: 'Web research',
+  image_retriever: 'Image sources',
+  document_retriever: 'Supporting documents',
   researcher: 'Researcher',
   analyst: 'Analyst',
   critic: 'Critic',

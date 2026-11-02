@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 
+LOGGER = logging.getLogger(__name__)
 
 class QueryClassificationError(ValueError):
     pass
@@ -34,7 +36,13 @@ class QueryLevelImportanceFinder:
     def __init__(self, llm):
         self.llm = llm
 
-    def classify(self, query: str, attachment_context: str = "", has_images: bool = False) -> dict:
+    def classify(
+        self,
+        query: str,
+        attachment_context: str = "",
+        has_images: bool = False,
+        force_reasoning: bool = False,
+    ) -> dict:
         prompt = (
             "You are the query level and importance finder. Decide whether this request needs the staged "
             "reasoning workflow or can be answered directly by the LLM. Choose `direct` only for simple, "
@@ -54,22 +62,33 @@ class QueryLevelImportanceFinder:
             "to classify a route. Web search is permitted only when `route` is `reasoning`. "
             "Set `search_topic` to `news` for news, `finance` for current financial/market information, "
             "otherwise `general`. Return one compact JSON object only with `route` (`direct` or `reasoning`), "
-            "`importance` (integer 1-5), `reason` (short string), `requires_web_search` (boolean), and "
+            "`importance` (integer 1-5), optional `reason` (short string), `requires_web_search` (boolean), and "
             "`search_topic` (`general`, `news`, or `finance`).\n\n"
             f"USER REQUEST:\n{query}\n\n"
             f"TEXT ATTACHMENTS PROVIDED: {'yes' if attachment_context else 'no'}\n"
             f"IMAGE ATTACHMENTS: {'yes' if has_images else 'no'}"
         )
+        if force_reasoning:
+            prompt += "\nResearch mode is enabled. Set route to reasoning and still classify whether web research is necessary."
+        generate_json = getattr(self.llm, "generate_json", None)
+        generate = generate_json if callable(generate_json) else self.llm.generate
         for attempt in range(2):
             try:
-                output = self.llm.generate(prompt, max_tokens=256)
+                output = generate(prompt, max_tokens=512)
                 result = _extract_classifier_result(output)
                 route = result["route"]
                 importance = result["importance"]
-                reason = result["reason"]
+                reason = result.get("reason", "")
                 if not isinstance(route, str) or route.strip().lower() not in {"direct", "reasoning"}:
                     raise ValueError("Query classifier route is invalid")
                 route = route.strip().lower()
+                if isinstance(importance, str):
+                    try:
+                        importance = float(importance.strip())
+                    except ValueError as error:
+                        raise ValueError(
+                            "Query classifier importance must be an integer from 1 to 5"
+                        ) from error
                 if isinstance(importance, bool) or not isinstance(importance, (int, float)):
                     raise ValueError("Query classifier importance must be an integer from 1 to 5")
                 if isinstance(importance, float) and not importance.is_integer():
@@ -80,6 +99,8 @@ class QueryLevelImportanceFinder:
                 if not isinstance(reason, str):
                     raise ValueError("Query classifier reason must be a string")
                 if importance >= 4:
+                    route = "reasoning"
+                if force_reasoning:
                     route = "reasoning"
                 requires_web_search = result.get("requires_web_search", False)
                 search_topic = result.get("search_topic", "general")
@@ -103,13 +124,24 @@ class QueryLevelImportanceFinder:
                 }
             except (ValueError, KeyError, TypeError) as error:
                 if attempt:
-                    raise QueryClassificationError(
-                        "The query classifier returned an invalid response after one retry."
-                    ) from error
+                    LOGGER.warning(
+                        "Query classifier returned invalid output after %s attempts (%s); "
+                        "using conservative reasoning route without web search",
+                        attempt + 1,
+                        error,
+                    )
+                    return {
+                        "decision": "reasoning",
+                        "importance": 3,
+                        "reason": "Classifier output was unavailable; using the reasoning workflow.",
+                        "requires_web_search": False,
+                        "search_topic": "general",
+                        "classification_fallback": True,
+                    }
                 prompt += (
                     "\nYour previous response did not match the required schema. "
                     "Return exactly one valid JSON object with route, integer importance from 1 to 5, "
-                    "string reason, boolean requires_web_search, and search_topic of general, news, or finance. "
+                    "optional string reason, boolean requires_web_search, and search_topic of general, news, or finance. "
                     "Do not include markdown or commentary."
                 )
 

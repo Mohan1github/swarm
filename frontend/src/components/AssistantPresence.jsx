@@ -52,7 +52,7 @@ export default function AssistantPresence({ isListening, isThinking, isSpeaking,
             />
           ))}
           <path className="assistant-core" d="M160 75 188 92 188 128 160 145 132 128 132 92Z" />
-          <path className="assistant-wave" d="M143 111h8l5-12 8 24 6-15 4 3h7" />
+          <path className="assistant-spark" d="M160 91c3 12 8 16 20 19-12 3-17 8-20 20-3-12-8-17-20-20 12-3 17-7 20-19Z" />
         </svg>
       </div>
       <div className="assistant-presence-copy">

@@ -1,8 +1,10 @@
 import importlib.util
 import asyncio
 import base64
+import io
 import json
 import sys
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,6 +32,10 @@ from agents.web_data_retriever_agent import (
     WebDataRetrieverAgent,
     _normalize_sources,
 )
+from agents.image_source_puller_agent import ImageSourcePullerAgent
+import agents.image_source_puller_agent as image_source_module
+import agents.supporting_document_retriever_agent as document_source_module
+from agents.supporting_document_retriever_agent import SupportingDocumentRetrieverAgent
 from agents.query_level_importance_finder import QueryLevelImportanceFinder
 from agents.response_summarizer_agent import ResponseSummarizerAgent
 import agents.orchestrator as orchestrator_module
@@ -882,6 +888,30 @@ def test_live_workflow_does_not_fall_back_after_provider_error():
     assert calls == 1
 
 
+def test_query_classifier_uses_json_mode_and_larger_token_budget():
+    requests = []
+
+    class JsonModeLLM:
+        def generate_json(self, prompt, max_tokens=800):
+            requests.append((prompt, max_tokens))
+            return json.dumps({
+                "route": "direct",
+                "importance": 1,
+                "reason": "Greeting.",
+                "requires_web_search": False,
+                "search_topic": "general",
+            })
+
+        def generate(self, prompt, max_tokens=800):
+            raise AssertionError("JSON mode should be used when the adapter supports it.")
+
+    result = QueryLevelImportanceFinder(JsonModeLLM()).classify("Hi")
+
+    assert result["decision"] == "direct"
+    assert len(requests) == 1
+    assert requests[0][1] == 512
+
+
 def test_query_classifier_retries_invalid_json_response():
     engine = module.ReasoningSwarmEngine(total_agents=0)
     prompts = []
@@ -907,26 +937,24 @@ def test_query_classifier_retries_invalid_json_response():
 
 
 def test_query_classifier_reports_invalid_response_after_retry():
-    engine = module.ReasoningSwarmEngine(total_agents=0)
     calls = 0
 
     class InvalidLLM:
-        enabled = True
-        model = "test-model"
-
         def generate(self, prompt, max_tokens=800):
             nonlocal calls
             calls += 1
             return "This is not JSON."
 
-    engine.llm = InvalidLLM()
-    events = list(engine.iter_workflow("Hi"))
+    route = QueryLevelImportanceFinder(InvalidLLM()).classify("Hi")
 
     assert calls == 2
-    assert events[-1] == {
-        "type": "error",
-        "stage": "query_level_importance_finder",
-        "message": "The query classifier returned an invalid response after one retry. Please retry.",
+    assert route == {
+        "decision": "reasoning",
+        "importance": 3,
+        "reason": "Classifier output was unavailable; using the reasoning workflow.",
+        "requires_web_search": False,
+        "search_topic": "general",
+        "classification_fallback": True,
     }
 
 
@@ -945,6 +973,53 @@ def test_query_classifier_accepts_integral_json_number_and_surrounding_text():
         "decision": "reasoning",
         "importance": 4,
         "reason": "Needs research.",
+        "requires_web_search": False,
+        "search_topic": "general",
+    }
+
+
+def test_research_mode_forces_reasoning_even_when_classifier_selects_direct():
+    class DirectClassifierLLM:
+        enabled = True
+        model = "test-model"
+
+        def generate(self, prompt, max_tokens=800):
+            assert "Research mode is enabled" in prompt
+            return json.dumps({
+                "route": "direct",
+                "importance": 1,
+                "reason": "Simple request.",
+                "requires_web_search": False,
+            })
+
+    engine = module.ReasoningSwarmEngine(total_agents=0)
+    engine.llm = DirectClassifierLLM()
+    events = engine.iter_workflow("Hi", force_reasoning=True)
+
+    setup = next(events)
+    stage_start = next(events)
+    events.close()
+
+    assert setup["route"]["decision"] == "reasoning"
+    assert stage_start["type"] == "stage_start"
+    assert stage_start["role"] == "document_retriever"
+    assert "planner" in stage_start["workflow_roles"]
+
+
+def test_query_classifier_normalizes_string_importance_and_optional_reason():
+    class ClassifierLLM:
+        def generate(self, prompt, max_tokens=800):
+            return json.dumps({
+                "route": "direct",
+                "importance": "4",
+                "requires_web_search": False,
+            })
+
+    route = QueryLevelImportanceFinder(ClassifierLLM()).classify("Compare these options.")
+    assert route == {
+        "decision": "reasoning",
+        "importance": 4,
+        "reason": "",
         "requires_web_search": False,
         "search_topic": "general",
     }
@@ -1042,6 +1117,386 @@ def test_simple_query_skips_staged_reasoning_workflow():
     assert events[-1]["selected_agents"] == 0
 
 
+def test_image_source_puller_filters_unsafe_results_and_private_queries(monkeypatch):
+    candidates = [
+        {"url": "https://images.example.com/one.jpg", "source_url": "https://example.com/one", "description": "First"},
+        {"url": "http://images.example.com/insecure.jpg"},
+        {"url": "https://images.example.com/one.jpg", "source_url": "https://example.com/duplicate"},
+        {"url": "https://user:pass@images.example.com/private.jpg"},
+        *[
+            {"url": f"https://images.example.com/{index}.jpg"}
+            for index in range(10)
+        ],
+    ]
+    page_url = "https://example.com/gallery"
+    monkeypatch.setattr(image_source_module, "_is_public_web_url", lambda _url: True)
+    agent = ImageSourcePullerAgent(
+        search_tool=lambda _query: [{"href": page_url}],
+        page_fetcher=lambda _url: "".join(
+            f'<img src="{candidate["url"]}" alt="{candidate.get("description", "")}">'
+            for candidate in candidates
+        ),
+    )
+
+    sources = agent.retrieve("Find images of mountain lakes")
+
+    assert ImageSourcePullerAgent.should_search("Find images of mountain lakes")
+    assert not ImageSourcePullerAgent.should_search("Show images of my garden")
+    assert not ImageSourcePullerAgent.should_search("Find pictures for alex@example.com")
+    assert len(sources) == 6
+    assert sources[0] == {
+        "image_url": "https://images.example.com/one.jpg",
+        "source_url": page_url,
+        "description": "First",
+    }
+    assert len({source["image_url"] for source in sources}) == len(sources)
+    assert all(source["source_url"] == page_url for source in sources)
+    assert server._bypass_answer_cache("Find images of mountain lakes")
+    assert not server._bypass_answer_cache("Tell me a short joke")
+    try:
+        ImageSourcePullerAgent(search_tool=lambda _query: {"error": "provider failure"}).retrieve(
+            "Find images of mountain lakes"
+        )
+    except RuntimeError as error:
+        assert str(error) == "The image source search provider returned an error."
+    else:
+        raise AssertionError("Image provider errors should not look like empty search results.")
+
+
+def test_image_source_puller_uses_free_ddgs_without_api_key(monkeypatch):
+    page_url = "https://example.com/forest"
+    calls = {}
+
+    class FakeDDGS:
+        def __init__(self, timeout):
+            calls["timeout"] = timeout
+
+        def images(self, **kwargs):
+            raise AssertionError("The crawler searches pages, not image metadata.")
+
+        def text(self, **kwargs):
+            calls["search"] = kwargs
+            return [{"href": page_url}]
+
+    monkeypatch.setitem(sys.modules, "ddgs", SimpleNamespace(DDGS=FakeDDGS))
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setattr(image_source_module, "_is_public_web_url", lambda _url: True)
+
+    sources = ImageSourcePullerAgent(
+        page_fetcher=lambda _url: '<img src="/forest.jpg" alt="Forest">'
+    ).retrieve("Find images of forests")
+
+    assert calls["timeout"] == 8
+    assert calls["search"] == {
+        "query": "Find images of forests",
+        "safesearch": "moderate",
+        "max_results": 4,
+        "backend": "auto",
+    }
+    assert sources == [{
+        "image_url": "https://example.com/forest.jpg",
+        "source_url": page_url,
+        "description": "Forest",
+    }]
+
+
+def test_supporting_document_retriever_crawls_pages_and_extracts_documents(monkeypatch):
+    page_url = "https://research.example.org/resources"
+    pdf_url = "https://research.example.org/files/study.pdf"
+    docx_url = "https://research.example.org/files/brief.docx"
+    docx_content = io.BytesIO()
+    with zipfile.ZipFile(docx_content, "w") as archive:
+        archive.writestr(
+            "word/document.xml",
+            (
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+                'wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>'
+                'Supporting evidence in a Word document.'
+                '</w:t></w:r></w:p></w:body></w:document>'
+            ),
+        )
+    resources = {
+        pdf_url: ("application/pdf", b"%PDF-1.7"),
+        docx_url: (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            docx_content.getvalue(),
+        ),
+    }
+
+    def fetch(url):
+        if url == page_url:
+            return "text/html", (
+                b"<html><title>Research materials</title><body>"
+                b'<a href="/files/study.pdf">Study report</a>'
+                b'<a href="/files/brief.docx">Project brief</a>'
+                b"</body></html>"
+            )
+        return resources[url]
+
+    monkeypatch.setattr(document_source_module, "is_public_web_url", lambda _url: True)
+    monkeypatch.setattr(
+        document_source_module,
+        "_extract_pdf_text",
+        lambda _content: ("PDF source evidence.", 8),
+    )
+    agent = SupportingDocumentRetrieverAgent(
+        search_tool=lambda _query: [{"href": page_url, "title": "Research materials"}],
+        resource_fetcher=fetch,
+    )
+
+    documents = agent.retrieve("Find supporting studies about the topic")
+
+    assert len(documents) == 2
+    assert documents[0] == {
+        "title": "Research materials",
+        "url": pdf_url,
+        "source_url": page_url,
+        "file_type": "PDF",
+        "pages": 8,
+        "excerpt": "PDF source evidence.",
+    }
+    assert documents[1]["url"] == docx_url
+    assert documents[1]["file_type"] == "Word document"
+    assert documents[1]["excerpt"] == "Supporting evidence in a Word document."
+    assert "DOCUMENT URL: " + pdf_url in agent.format_context(documents)
+    assert "untrusted source material" in agent.format_context(documents)
+
+
+def test_supporting_document_search_uses_separate_pdf_and_docx_queries(monkeypatch):
+    calls = []
+
+    class FakeDDGS:
+        def __init__(self, timeout):
+            assert timeout == 8
+
+        def text(self, **kwargs):
+            calls.append(kwargs)
+            extension = "pdf" if "filetype:pdf" in kwargs["query"] else "docx"
+            return [{"href": f"https://research.example.org/study.{extension}"}]
+
+    monkeypatch.setitem(sys.modules, "ddgs", SimpleNamespace(DDGS=FakeDDGS))
+
+    results = SupportingDocumentRetrieverAgent()._search_pages("Compare climate policies")
+
+    assert len(calls) == 2
+    assert [call["max_results"] for call in calls] == [4, 4]
+    assert "filetype:pdf" in calls[0]["query"]
+    assert "filetype:docx" in calls[1]["query"]
+    assert [result["href"] for result in results] == [
+        "https://research.example.org/study.pdf",
+        "https://research.example.org/study.docx",
+    ]
+
+
+def test_supporting_document_stage_only_runs_in_research_mode():
+    class ReasoningClassifier:
+        def classify(self, *args, **kwargs):
+            return {
+                "decision": "reasoning",
+                "importance": 3,
+                "reason": "Research request.",
+                "requires_web_search": False,
+            }
+
+    engine = module.ReasoningSwarmEngine(total_agents=0)
+    engine.llm = SimpleNamespace(enabled=True, model="test-model")
+    engine.query_level_finder = ReasoningClassifier()
+
+    normal_events = engine.iter_workflow("Compare these approaches")
+    next(normal_events)
+    normal_start = next(normal_events)
+    normal_events.close()
+
+    research_events = engine.iter_workflow(
+        "Compare these approaches",
+        force_reasoning=True,
+    )
+    next(research_events)
+    research_start = next(research_events)
+    research_events.close()
+
+    assert normal_start["role"] == "planner"
+    assert "document_retriever" not in normal_start["workflow_roles"]
+    assert research_start["role"] == "document_retriever"
+    assert "document_retriever" in research_start["workflow_roles"]
+
+
+def test_supporting_documents_feed_research_stages_and_final_payload(monkeypatch):
+    document = {
+        "title": "Field study",
+        "url": "https://research.example.org/field-study.pdf",
+        "source_url": "https://research.example.org/publications",
+        "file_type": "PDF",
+        "pages": 6,
+        "excerpt": "The field study reports the measured results.",
+    }
+
+    class FakeDocumentRetriever:
+        def retrieve(self, _query):
+            return [document]
+
+        @staticmethod
+        def format_context(documents):
+            return SupportingDocumentRetrieverAgent.format_context(documents)
+
+    class FakeLLM:
+        enabled = True
+        model = "test-model"
+
+        def __init__(self):
+            self.prompts = []
+
+        def generate(self, prompt, max_tokens=800):
+            self.prompts.append(prompt)
+            if "You are the planner stage" in prompt:
+                return json.dumps({
+                    "plan": "Review the supporting source.",
+                    "action_probabilities": {
+                        "decompose": 1, "research": 1, "analyze": 1,
+                        "challenge": 1, "execute": 1, "validate": 1,
+                        "summarize": 1,
+                    },
+                })
+            if "You are a query-focus agent" in prompt:
+                return json.dumps({
+                    "exact_request": "Summarize recent field-study evidence",
+                    "focus_points": ["field-study evidence"],
+                    "comparative_points": [],
+                    "constraints": [],
+                    "search_terms": "field-study evidence",
+                })
+            if "numeric `validation_score`" in prompt:
+                return json.dumps({"validation_score": 0.9, "issues": []})
+            return "Research output grounded in the source."
+
+    monkeypatch.setattr(
+        orchestrator_module,
+        "SupportingDocumentRetrieverAgent",
+        FakeDocumentRetriever,
+    )
+    engine = orchestrator_module.ReasoningSwarmEngine(total_agents=0)
+    engine.llm = FakeLLM()
+    engine.query_level_finder = SimpleNamespace(
+        classify=lambda *args, **kwargs: {
+            "decision": "reasoning",
+            "importance": 3,
+            "reason": "Research requested.",
+            "requires_web_search": False,
+        }
+    )
+
+    events = list(engine.iter_workflow(
+        "Summarize recent field-study evidence",
+        force_reasoning=True,
+    ))
+    complete = events[-1]
+    document_step = next(
+        step for step in complete["steps"]
+        if step["role"] == "document_retriever"
+    )
+    researcher_prompt = next(
+        prompt for prompt in engine.llm.prompts
+        if "You are the researcher stage" in prompt
+    )
+
+    assert complete["type"] == "complete"
+    assert complete["supporting_documents"] == [document]
+    assert document_step["ui_data"]["documents"] == [document]
+    assert document["url"] in researcher_prompt
+    assert "untrusted source material" in researcher_prompt
+
+
+def test_image_crawler_rejects_non_public_destinations():
+    assert not image_source_module._is_public_web_url("http://8.8.8.8/")
+    assert not image_source_module._is_public_web_url("https://127.0.0.1/")
+    assert not image_source_module._is_public_web_url("https://[::1]/")
+    assert image_source_module._is_public_web_url("https://8.8.8.8/")
+
+
+def test_image_source_retrieval_runs_in_direct_and_reasoning_workflows(monkeypatch):
+    source = {
+        "image_url": "https://images.example.com/lake.jpg",
+        "source_url": "https://example.com/lake",
+        "description": "Mountain lake",
+    }
+
+    class FakeImageSourcePuller:
+        @staticmethod
+        def should_search(_query):
+            return True
+
+        def retrieve(self, _query):
+            return [source]
+
+    class FakeLLM:
+        enabled = True
+        model = "test-model"
+
+        def generate(self, prompt, max_tokens=800):
+            if "You are the planner stage" in prompt:
+                return json.dumps({
+                    "plan": "Search and summarize.",
+                    "action_probabilities": {
+                        "decompose": 1, "research": 1, "analyze": 1,
+                        "challenge": 1, "execute": 1, "validate": 1,
+                        "summarize": 1,
+                    },
+                })
+            if "You are a query-focus agent" in prompt:
+                return json.dumps({
+                    "exact_request": "Find images of mountain lakes",
+                    "focus_points": ["mountain lakes"],
+                    "comparative_points": [],
+                    "constraints": [],
+                    "search_terms": "mountain lakes",
+                })
+            if "numeric `validation_score`" in prompt:
+                return json.dumps({"validation_score": 0.9, "issues": []})
+            return "Completed stage output."
+
+    monkeypatch.setattr(
+        orchestrator_module,
+        "ImageSourcePullerAgent",
+        FakeImageSourcePuller,
+    )
+    engine = orchestrator_module.ReasoningSwarmEngine(total_agents=0)
+    engine.llm = FakeLLM()
+    engine.query_level_finder = SimpleNamespace(
+        classify=lambda *args, **kwargs: {
+            "decision": "direct",
+            "importance": 1,
+            "reason": "Direct answer.",
+        }
+    )
+
+    direct_events = list(engine.iter_workflow("Find images of mountain lakes"))
+    direct_complete = direct_events[-1]
+
+    assert direct_complete["type"] == "complete"
+    assert direct_complete["image_sources"] == [source]
+    assert any(step["role"] == "image_retriever" for step in direct_complete["steps"])
+
+    engine.query_level_finder = SimpleNamespace(
+        classify=lambda *args, **kwargs: {
+            "decision": "reasoning",
+            "importance": 3,
+            "reason": "Needs staged research.",
+            "requires_web_search": False,
+        }
+    )
+    reasoning_events = list(engine.iter_workflow("Find images of mountain lakes"))
+    stage_start = next(event for event in reasoning_events if event["type"] == "stage_start")
+    reasoning_complete = reasoning_events[-1]
+    image_step = next(
+        step for step in reasoning_complete["steps"]
+        if step["role"] == "image_retriever"
+    )
+
+    assert stage_start["workflow_roles"][0] == "image_retriever"
+    assert reasoning_complete["image_sources"] == [source]
+    assert image_step["ui_data"]["image_sources"] == [source]
+
+
 def test_answer_query_requires_a_live_backend():
     engine = module.ReasoningSwarmEngine(total_agents=0)
     engine.llm = type("DisabledLLM", (), {"enabled": False})()
@@ -1108,6 +1563,19 @@ def test_api_response_contains_live_execution_results(monkeypatch):
                 "validation_issues": ["Check one assumption."],
                 "latency_ms": 1100.0,
                 "model": "test-model",
+                "image_sources": [{
+                    "image_url": "https://images.example.com/lake.jpg",
+                    "source_url": "https://example.com/lake",
+                    "description": "Mountain lake",
+                }],
+                "supporting_documents": [{
+                    "title": "Field study",
+                    "url": "https://research.example.org/field-study.pdf",
+                    "source_url": "https://research.example.org/publications",
+                    "file_type": "PDF",
+                    "pages": 6,
+                    "excerpt": "Study excerpt.",
+                }],
             }
 
     monkeypatch.setattr(server, "ReasoningSwarmEngine", FakeEngine)
@@ -1124,6 +1592,8 @@ def test_api_response_contains_live_execution_results(monkeypatch):
     assert response.execution_steps[0]["role"] == "planner"
     assert "LIVE LLM WORKFLOW" in response.execution_graph
     assert "correctness" not in response.metrics
+    assert response.image_sources[0]["description"] == "Mountain lake"
+    assert response.supporting_documents[0]["title"] == "Field study"
 
 
 def test_api_rejects_requests_without_live_provider(monkeypatch):
@@ -1259,6 +1729,121 @@ def test_prepare_attachments_extracts_text_and_preserves_image_data():
     assert image_data_urls == [image_data]
 
 
+def test_prepare_attachments_extracts_docx_for_reviewer():
+    docx_content = io.BytesIO()
+    with zipfile.ZipFile(docx_content, "w") as archive:
+        archive.writestr(
+            "word/document.xml",
+            (
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+                'wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>'
+                'DOCX reviewer source text.'
+                '</w:t></w:r></w:p></w:body></w:document>'
+            ),
+        )
+    document_data = (
+        "data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,"
+        + base64.b64encode(docx_content.getvalue()).decode("ascii")
+    )
+    context, images = server._prepare_attachments([
+        server.AttachmentRequest(
+            name="review.docx",
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            content=document_data,
+        )
+    ])
+
+    assert "FILE: review.docx\nDOCX reviewer source text." in context
+    assert images == []
+
+
+def test_document_search_api_requires_research_mode(monkeypatch):
+    class UnexpectedRetriever:
+        def retrieve(self, _query):
+            raise AssertionError("Search must not run outside Research mode.")
+
+    monkeypatch.setattr(server, "SupportingDocumentRetrieverAgent", UnexpectedRetriever)
+
+    try:
+        server.search_supporting_documents(
+            server.DocumentSearchRequest(query="Exact supporting report", research_mode=False),
+            TEST_USER,
+        )
+    except server.HTTPException as error:
+        assert error.status_code == 403
+        assert "only in Research mode" in error.detail
+    else:
+        raise AssertionError("Document search must be gated by Research mode.")
+
+
+def test_online_document_review_uses_exact_retrieved_url_and_excerpt(monkeypatch):
+    document = {
+        "title": "Annual study.pdf",
+        "url": "https://research.example.org/files/annual-study.pdf",
+        "source_url": "https://research.example.org/resources",
+        "file_type": "PDF",
+        "pages": 12,
+        "excerpt": "The study reports primary outcomes and limitations.",
+        "review_text": (
+            "The study reports primary outcomes and limitations. "
+            "The full extracted text continues beyond the preview excerpt."
+        ),
+    }
+
+    class FakeRetriever:
+        def retrieve_document(self, url):
+            assert url == document["url"]
+            return document
+
+    class FakeLLM:
+        enabled = True
+
+        def generate(self, prompt, max_tokens):
+            assert document["url"] in prompt
+            assert document["review_text"] in prompt
+            assert "untrusted evidence" in prompt
+            assert max_tokens == 1400
+            return "The study reports these findings and limitations."
+
+    monkeypatch.setattr(server, "SupportingDocumentRetrieverAgent", FakeRetriever)
+    monkeypatch.setattr(server, "build_llm_adapter", lambda: FakeLLM())
+
+    result = server.review_online_document(
+        server.OnlineDocumentReviewRequest(
+            url=document["url"],
+            research_mode=True,
+        ),
+        TEST_USER,
+    )
+
+    assert result == {
+        "document": {
+            key: value for key, value in document.items()
+            if key != "review_text"
+        },
+        "review": "The study reports these findings and limitations.",
+    }
+
+
+def test_uploaded_document_review_requires_research_mode():
+    try:
+        server.review_documents(
+            server.DocumentReviewRequest(
+                attachments=[server.AttachmentRequest(
+                    name="review.pdf",
+                    media_type="application/pdf",
+                    content="data:application/pdf;base64,",
+                )],
+                research_mode=False,
+            ),
+            TEST_USER,
+        )
+    except server.HTTPException as error:
+        assert error.status_code == 403
+    else:
+        raise AssertionError("Uploaded document review must be gated by Research mode.")
+
+
 def test_stream_api_passes_attachment_context_into_workflow(monkeypatch):
     received = {}
 
@@ -1289,6 +1874,54 @@ def test_stream_api_passes_attachment_context_into_workflow(monkeypatch):
     assert received["query"] == "Summarize this"
     assert "FILE: brief.md\nKey point" in received["attachment_context"]
     assert received["image_data_urls"] == []
+
+
+def test_research_mode_stream_bypasses_cache_and_forces_agent_workflow(monkeypatch, tmp_path):
+    cache = VectorAnswerCache(tmp_path / "research-mode-cache.sqlite3")
+    cache.store(TEST_USER.id, "test-model", "A simple request", {
+        "answer": "Cached response",
+        "steps": [],
+        "selected_agents": 0,
+        "action_probabilities": {},
+        "validation_score": 0.0,
+        "validation_issues": [],
+        "model": "test-model",
+    })
+    monkeypatch.setattr(server, "ANSWER_CACHE", cache)
+    monkeypatch.setattr(server, "build_llm_adapter", lambda: SimpleNamespace(model="test-model"))
+    monkeypatch.setattr(server, "ACTIVITY_STORE", UserActivityStore(tmp_path / "research-activity.sqlite3"))
+    received = {}
+
+    class FakeEngine:
+        llm = SimpleNamespace(enabled=True, model="test-model")
+
+        def __init__(self, total_agents):
+            pass
+
+        def iter_workflow(self, query, user_id=None, force_reasoning=False):
+            received["query"] = query
+            received["force_reasoning"] = force_reasoning
+            yield {
+                "type": "complete",
+                "answer": "Research workflow response",
+                "steps": [],
+                "route": {"decision": "reasoning", "requires_web_search": False},
+            }
+
+    monkeypatch.setattr(server, "ReasoningSwarmEngine", FakeEngine)
+    response = server.stream_swarm_query(
+        server.QueryRequest(query="A simple request", research_mode=True),
+        _current_user=TEST_USER,
+    )
+
+    async def read_events():
+        chunks = [chunk async for chunk in response.body_iterator]
+        return "".join(chunk.decode() if isinstance(chunk, bytes) else chunk for chunk in chunks)
+
+    body = asyncio.run(read_events())
+    assert received == {"query": "A simple request", "force_reasoning": True}
+    assert '"type": "cache_hit"' not in body
+    assert "Research workflow response" in body
 
 
 def test_workflow_routes_reject_anonymous_requests():
@@ -1640,6 +2273,148 @@ def test_llm_adapter_sends_images_to_configured_vision_model():
     content = requests[0]["messages"][0]["content"]
     assert content[0] == {"type": "text", "text": "Describe the image"}
     assert content[1]["image_url"]["url"] == "data:image/png;base64,aW1hZ2U="
+
+
+def test_llm_adapter_generates_json_mode_with_classifier_settings():
+    requests = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            requests.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"route":"direct","importance":1}',
+                    ),
+                )],
+            )
+
+    adapter = llm_client.LLMAdapter(api_key="test-key", model="json-model")
+    adapter.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+    assert adapter.generate_json("Classify this request") == '{"route":"direct","importance":1}'
+    assert requests[0]["model"] == "json-model"
+    assert requests[0]["response_format"] == {"type": "json_object"}
+    assert requests[0]["temperature"] == 0
+    assert requests[0]["max_tokens"] == 512
+
+
+def test_llm_adapter_retries_empty_completion_before_returning_text(monkeypatch):
+    responses = [
+        SimpleNamespace(choices=[]),
+        SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="stop",
+            message=SimpleNamespace(content="  Recovered response.  ", refusal=None),
+        )]),
+    ]
+    requests = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            requests.append(kwargs)
+            return responses.pop(0)
+
+    adapter = llm_client.LLMAdapter(api_key="test-key", model="empty-model")
+    adapter.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _seconds: None)
+
+    assert adapter.generate("Test recoverable empty completion") == "Recovered response."
+    assert len(requests) == 2
+
+
+def test_llm_adapter_reports_persistent_empty_completion(monkeypatch):
+    class FakeCompletions:
+        def create(self, **kwargs):
+            return SimpleNamespace(choices=[SimpleNamespace(
+                finish_reason="length",
+                message=SimpleNamespace(content=None, refusal=None),
+            )])
+
+    adapter = llm_client.LLMAdapter(api_key="test-key", model="empty-model")
+    adapter.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _seconds: None)
+
+    try:
+        adapter.generate("Test persistent empty completion", max_tokens=300)
+    except llm_client.EmptyLLMResponseError as error:
+        assert error.attempts == 3
+        assert error.finish_reason == "length"
+        assert str(error) == (
+            "The LLM provider returned no text after 3 attempts. "
+            "Last finish reason: length."
+        )
+    else:
+        raise AssertionError("Persistent empty completions must be reported explicitly.")
+
+
+def test_llm_adapter_increases_token_budget_after_length_empty(monkeypatch):
+    requests = []
+    responses = [
+        SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="length",
+            message=SimpleNamespace(content=None, refusal=None),
+        )]),
+        SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="stop",
+            message=SimpleNamespace(content="Recovered with more tokens.", refusal=None),
+        )]),
+    ]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            requests.append(kwargs)
+            return responses.pop(0)
+
+    adapter = llm_client.LLMAdapter(api_key="test-key", model="length-model")
+    adapter.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _seconds: None)
+
+    assert adapter.generate("Test token budget recovery", max_tokens=300) == (
+        "Recovered with more tokens."
+    )
+    assert [request["max_tokens"] for request in requests] == [300, 600]
+
+
+def test_llm_adapter_returns_provider_refusal_text():
+    class FakeCompletions:
+        def create(self, **kwargs):
+            return SimpleNamespace(choices=[SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(content=None, refusal="I cannot help with that request."),
+            )])
+
+    adapter = llm_client.LLMAdapter(api_key="test-key", model="refusal-model")
+    adapter.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+    assert adapter.generate("Test provider refusal") == "I cannot help with that request."
+
+
+def test_llm_adapter_retries_stream_when_no_text_is_returned(monkeypatch):
+    responses = [
+        [],
+        [SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="Recovered stream."))])],
+    ]
+    requests = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            requests.append(kwargs)
+            return responses.pop(0)
+
+    adapter = llm_client.LLMAdapter(api_key="test-key", model="stream-model")
+    adapter.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _seconds: None)
+
+    assert list(adapter.stream("Test empty stream recovery")) == ["Recovered stream."]
+    assert len(requests) == 2
+
+
+def test_empty_provider_error_has_actionable_diagnostic():
+    error = llm_client.EmptyLLMResponseError(3, "length")
+
+    assert llm_client.describe_provider_error(error) == (
+        "The LLM provider returned no text after 3 attempts. Last finish reason: length."
+    )
 
 
 def test_llm_adapter_streams_text_deltas():

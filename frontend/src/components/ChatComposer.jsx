@@ -129,7 +129,7 @@ export default function ChatComposer({
           className="attachment-input"
           type="file"
           multiple
-          accept="image/png,image/jpeg,image/webp,application/pdf,.txt,.md,.csv,.json,.py,.js,.jsx,.ts,.tsx,.html,.css,.xml,.yaml,.yml,.log,.sql,.sh"
+          accept="image/png,image/jpeg,image/webp,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.pdf,.docx,.txt,.md,.csv,.json,.py,.js,.jsx,.ts,.tsx,.html,.css,.xml,.yaml,.yml,.log,.sql,.sh"
           onChange={handleFileChange}
         />
         {attachments.length > 0 ? (

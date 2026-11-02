@@ -2,7 +2,7 @@
 
 This prototype runs an eleven-stage reasoning workflow through a configured LLM provider. For reasoning requests that need current facts, news, or explicit source verification, it conditionally runs an additional web-retrieval stage. A pool of 10,000 lightweight local workers supports selection and planning; the workers themselves are not 10,000 independent LLM sessions.
 
-The planner, optional web retriever, researcher, analyst, critic, executor, synthesizer draft, corrector, synthesizer revision, query-focus agent, response summarizer, and validator run in sequence. Basic/direct questions do not invoke web search. The web retriever uses LangGraph and Tavily to collect attributed text only, then stores user-scoped dense vectors, source text, topic links, and nearest-neighbor graph edges in SQLite. Retrieval combines BM25, dense cosine similarity, and Dijkstra traversal. The query-focus agent preserves the exact request while extracting constraints and comparisons. Authenticated API workflows store per-user agent-output feature vectors separately. The corrector gives evidence-grounded feedback before final validation. The validator returns a model self-assessment, which is not a factual correctness guarantee; web sources are evidence, not proof.
+The planner, optional web retriever, researcher, analyst, critic, executor, synthesizer draft, corrector, synthesizer revision, query-focus agent, response summarizer, and validator run in sequence. Basic/direct questions do not invoke web search. The web retriever uses LangGraph and Tavily to collect attributed text only, then stores user-scoped dense vectors, source text, topic links, and nearest-neighbor graph edges in SQLite. Explicit image requests use DDGS to discover public pages, then a bounded crawler extracts image URLs and page attribution from those pages; image files are loaded by the browser and are not downloaded or persisted by the API. DDGS has no API or subscription fee, but its upstream search backends may impose rate limits or change availability. The crawler only fetches public HTTPS pages, follows a limited number of redirects, and caps page size and count. Research mode additionally searches public pages for linked PDF and DOCX documents, extracts bounded text excerpts, and shows the original document and discovery-page links; this document crawler does not run in normal mode. The **Documents** panel is available only while Research mode is active: it can search and review online documents or review user-uploaded PDF/DOCX files. Retrieved document text is treated as untrusted evidence. Retrieval combines BM25, dense cosine similarity, and Dijkstra traversal. The query-focus agent preserves the exact request while extracting constraints and comparisons. Authenticated API workflows store per-user agent-output feature vectors separately. The corrector gives evidence-grounded feedback before final validation. The validator returns a model self-assessment, which is not a factual correctness guarantee; web sources are evidence, not proof.
 
 Evidence-sensitive web research now adds a **claim-level Evidence Ledger**. A dedicated auditor labels answer claims as supported, contradicted, mixed, or insufficient evidence and links them to source passages only when the quoted text can be matched against the retrieved source. Reports persist privately per user and can be listed with `GET /api/evidence-ledger`; clearing history also clears them. These are source-based model assessments, not proof of truth. The ledger runs only when live web research ran, and adds one LLM call to those queries.
 
@@ -38,7 +38,7 @@ See [swarm_architecture.md](swarm_architecture.md) for detailed subsystem flows.
 
 ## Run the API
 
-Configure `GROQ_API_KEY` in a local `.env` file to run the application. Add `TAVILY_API_KEY` to enable live web retrieval for eligible reasoning requests, then run:
+Configure `GROQ_API_KEY` in a local `.env` file to run the application. Add `TAVILY_API_KEY` to enable live text web retrieval for eligible reasoning requests. Image search uses DDGS without a search API key, then run:
 
 ```powershell
 docker compose up --build
@@ -57,6 +57,8 @@ When the user opens Assistant mode, a dedicated continuity agent uses only that 
 Agent output vectors are separate from the answer cache and activity graph. They are user-scoped, retain up to 5,000 stage outputs per user, and use the project's local hashed lexical feature vectors rather than a hosted embedding service. Set `AGENT_OUTPUT_VECTOR_DB_PATH` to choose another local database file.
 
 The API is at `http://localhost:8000`; interactive docs are at `/docs`. Use `POST /api/swarm/query` for a complete result or `POST /api/swarm/query/stream` for Server-Sent Events after each stage completes.
+
+Research-mode document endpoints require a signed-in user and `"research_mode": true`: `POST /api/research/documents/search` accepts a query and returns extracted excerpts with exact document and discovery-page URLs; `POST /api/research/documents/review-online` accepts an exact public PDF/DOCX URL for an AI review; `POST /api/research/documents/review` accepts uploaded PDF/DOCX files and review instructions.
 
 The GUI and command-line apps also require `GROQ_API_KEY`. For local Python setup and endpoint examples, see [api.md](api.md).
 

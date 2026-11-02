@@ -6,6 +6,7 @@ export default function ChatSidebar({
   latency,
   validationScore,
   isRunning,
+  researchMode,
   steps,
   activeStage,
   onShowHistory,
@@ -32,31 +33,33 @@ export default function ChatSidebar({
         <span>Chat history</span>
       </button>
 
-      <div className="sidebar-card">
-        <div className="card-header">
-          <span>Live workflow</span>
-          <span className={`status-dot ${isRunning ? 'live' : ''}`} />
+      {researchMode ? (
+        <div className="sidebar-card">
+          <div className="card-header">
+            <span>Live workflow</span>
+            <span className={`status-dot ${isRunning ? 'live' : ''}`} />
+          </div>
+          <div className="stage-stack">
+            {stageOrder.map((stage) => {
+              const isComplete = Boolean(stepLookup[stage])
+              const isActive = isRunning && activeStage === stage
+              return (
+                <div
+                  key={stage}
+                  className={`stage-pill ${isComplete ? 'complete' : ''} ${isActive ? 'active' : ''}`}
+                  aria-current={isActive ? 'step' : undefined}
+                  aria-label={`${stageLabels[stage]}${isActive ? ', working' : isComplete ? ', completed' : ', waiting'}`}
+                >
+                  <span>{stageLabels[stage]}</span>
+                  <span className="stage-pill-state" aria-hidden="true">
+                    {isActive ? 'Working' : isComplete ? 'Done' : ''}
+                  </span>
+                </div>
+              )
+            })}
+          </div>
         </div>
-        <div className="stage-stack">
-          {stageOrder.map((stage) => {
-            const isComplete = Boolean(stepLookup[stage])
-            const isActive = isRunning && activeStage === stage
-            return (
-              <div
-                key={stage}
-                className={`stage-pill ${isComplete ? 'complete' : ''} ${isActive ? 'active' : ''}`}
-                aria-current={isActive ? 'step' : undefined}
-                aria-label={`${stageLabels[stage]}${isActive ? ', working' : isComplete ? ', completed' : ', waiting'}`}
-              >
-                <span>{stageLabels[stage]}</span>
-                <span className="stage-pill-state" aria-hidden="true">
-                  {isActive ? 'Working' : isComplete ? 'Done' : ''}
-                </span>
-              </div>
-            )
-          })}
-        </div>
-      </div>
+      ) : null}
 
       <div className="sidebar-card compact">
         <div className="metric-row">

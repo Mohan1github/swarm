@@ -8,6 +8,10 @@ export default function useSwarmStream({ token }) {
   const [isRunning, setIsRunning] = useState(false)
   const [steps, setSteps] = useState([])
   const [activeStage, setActiveStage] = useState(null)
+  const [activeStageIndex, setActiveStageIndex] = useState(-1)
+  const [stageTotal, setStageTotal] = useState(0)
+  const [stageRoles, setStageRoles] = useState([])
+  const [isResearchRun, setIsResearchRun] = useState(false)
   const [logs, setLogs] = useState([])
   const [messages, setMessages] = useState(initialMessages)
   const [selectedAgents, setSelectedAgents] = useState(0)
@@ -21,6 +25,10 @@ export default function useSwarmStream({ token }) {
     setStatus('Ready')
     setSteps([])
     setActiveStage(null)
+    setActiveStageIndex(-1)
+    setStageTotal(0)
+    setStageRoles([])
+    setIsResearchRun(false)
     setLogs([])
     setMessages(initialMessages)
     setSelectedAgents(0)
@@ -31,7 +39,7 @@ export default function useSwarmStream({ token }) {
     setValidationIssues([])
   }
 
-  const runWorkflow = async (query, attachments = [], event) => {
+  const runWorkflow = async (query, attachments = [], event, researchMode = false) => {
     event?.preventDefault()
     const trimmed = query.trim()
     if (!trimmed || isRunning) return
@@ -41,6 +49,10 @@ export default function useSwarmStream({ token }) {
     setError('')
     setSteps([])
     setActiveStage(null)
+    setActiveStageIndex(-1)
+    setStageTotal(0)
+    setStageRoles([])
+    setIsResearchRun(researchMode)
     setLogs([])
     setActionProbabilities({})
     setValidationScore(null)
@@ -95,6 +107,9 @@ export default function useSwarmStream({ token }) {
 
       if (payload.type === 'stage_start') {
         setActiveStage(payload.role)
+        setActiveStageIndex(payload.stage_index ?? -1)
+        setStageTotal(payload.stage_total ?? 0)
+        if (Array.isArray(payload.workflow_roles)) setStageRoles(payload.workflow_roles)
         setStatus(`${stageLabels[payload.role] ?? payload.role} working`)
         return
       }
@@ -148,6 +163,10 @@ export default function useSwarmStream({ token }) {
             content: finalAnswer,
             evidenceLedger: payload.evidence_ledger ?? null,
             evidenceLedgerError: payload.evidence_ledger_error ?? '',
+            imageSources: payload.image_sources ?? [],
+            imageSearchError: payload.image_search_error ?? '',
+            supportingDocuments: payload.supporting_documents ?? [],
+            supportingDocumentError: payload.supporting_document_error ?? '',
           }]
         })
         setSelectedAgents(payload.selected_agents ?? selectedAgents)
@@ -193,6 +212,7 @@ export default function useSwarmStream({ token }) {
         },
         body: JSON.stringify({
           query: trimmed,
+          research_mode: researchMode,
           attachments: serializedAttachments.map(({ name, media_type, content }) => ({
             name,
             media_type,
@@ -265,6 +285,10 @@ export default function useSwarmStream({ token }) {
     isRunning,
     steps,
     activeStage,
+    activeStageIndex,
+    stageTotal,
+    stageRoles,
+    isResearchRun,
     logs,
     messages,
     selectedAgents,

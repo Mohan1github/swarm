@@ -1,8 +1,15 @@
-const dataUrlTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'application/pdf'])
+const dataUrlTypes = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'application/pdf',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+])
 
 const mediaTypesByExtension = {
   csv: 'text/csv',
   css: 'text/css',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   html: 'text/html',
   jpeg: 'image/jpeg',
   jpg: 'image/jpeg',

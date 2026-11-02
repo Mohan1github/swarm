@@ -77,6 +77,72 @@ function EvidenceLedger({ report, error }) {
   )
 }
 
+function ImageSourceGallery({ sources, error }) {
+  if ((!Array.isArray(sources) || !sources.length) && !error) return null
+
+  return (
+    <section className="image-source-gallery" aria-label="Image search results">
+      <header className="image-source-gallery-heading">
+        <strong>Images from the web</strong>
+        <span>Open each source for attribution and usage details.</span>
+      </header>
+      {error ? <p className="image-source-error" role="status">{error}</p> : null}
+      {sources?.length ? (
+        <div className="image-source-grid">
+          {sources.map((source, index) => (
+            <a
+              className="image-source-card"
+              href={source.source_url}
+              key={`${source.image_url}-${index}`}
+              target="_blank"
+              rel="noreferrer"
+              aria-label={`Open image source ${index + 1}${source.description ? `: ${source.description}` : ''}`}
+            >
+              <img
+                src={source.image_url}
+                alt={source.description || `Image result ${index + 1}`}
+                loading="lazy"
+                referrerPolicy="no-referrer"
+                onError={(event) => {
+                  event.currentTarget.hidden = true
+                }}
+              />
+              <span>{source.description || `Image source ${index + 1}`}</span>
+            </a>
+          ))}
+        </div>
+      ) : null}
+    </section>
+  )
+}
+
+function SupportingDocumentList({ documents, error }) {
+  if ((!Array.isArray(documents) || !documents.length) && !error) return null
+
+  return (
+    <section className="agent-source-output" aria-label="Supporting documents">
+      {error ? <p className="image-source-error" role="status">{error}</p> : null}
+      {documents?.map((document, index) => (
+        <article className="agent-source-card" key={`${document.url}-${index}`}>
+          <div className="agent-source-index">
+            {document.file_type || 'Document'} {index + 1}
+          </div>
+          <a href={document.url} target="_blank" rel="noreferrer">
+            {document.title || document.url}
+          </a>
+          <div className="agent-source-meta">
+            {document.pages ? `${document.pages} pages · ` : ''}
+            Source page: <a href={document.source_url} target="_blank" rel="noreferrer">
+              {document.source_url}
+            </a>
+          </div>
+          {document.excerpt ? <p>{document.excerpt}</p> : null}
+        </article>
+      ))}
+    </section>
+  )
+}
+
 async function copyTextToClipboard(text) {
   if (!text) return false
   if (navigator.clipboard && window.isSecureContext) {
@@ -203,6 +269,18 @@ export default function ChatMessages({ messages, error, onAssistantProgress }) {
                     uiData={message.uiData}
                   />
                 )}
+                {message.role === 'assistant' ? (
+                  <ImageSourceGallery
+                    sources={message.imageSources}
+                    error={message.imageSearchError}
+                  />
+                ) : null}
+                {message.role === 'assistant' ? (
+                  <SupportingDocumentList
+                    documents={message.supportingDocuments}
+                    error={message.supportingDocumentError}
+                  />
+                ) : null}
               </div>
 
               {message.role === 'assistant' ? (
