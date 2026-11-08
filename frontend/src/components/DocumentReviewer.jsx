@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import serializeAttachment from '../utils/serializeAttachment'
 
 const MAX_FILE_BYTES = 5_000_000
@@ -11,6 +11,9 @@ function documentName(document, index) {
 export default function DocumentReviewer({
   token,
   initialDocuments = [],
+  initialFiles = [],
+  initialReviewQuery = '',
+  autoReviewOnOpen = false,
   onClose,
 }) {
   const fileInput = useRef(null)
@@ -19,15 +22,17 @@ export default function DocumentReviewer({
   const [searchResults, setSearchResults] = useState(initialDocuments)
   const [isSearching, setIsSearching] = useState(false)
   const [reviewQuery, setReviewQuery] = useState(
-    'Review for accuracy, completeness, evidence quality, and actionable improvements.',
+    initialReviewQuery
+      || 'Review for accuracy, completeness, evidence quality, and actionable improvements.',
   )
-  const [files, setFiles] = useState([])
+  const [files, setFiles] = useState(initialFiles)
   const [review, setReview] = useState('')
   const [isReviewing, setIsReviewing] = useState(false)
   const [onlineReview, setOnlineReview] = useState('')
   const [isReviewingOnline, setIsReviewingOnline] = useState(false)
   const [error, setError] = useState('')
   const [selectedDocument, setSelectedDocument] = useState(null)
+  const autoReviewStarted = useRef(false)
 
   const searchDocuments = async (event) => {
     event.preventDefault()
@@ -116,8 +121,8 @@ export default function DocumentReviewer({
     setReview('')
   }
 
-  const reviewDocuments = async (event) => {
-    event.preventDefault()
+  const reviewDocuments = useCallback(async (event) => {
+    event?.preventDefault()
     if (!files.length || isReviewing) return
     setIsReviewing(true)
     setError('')
@@ -150,7 +155,13 @@ export default function DocumentReviewer({
     } finally {
       setIsReviewing(false)
     }
-  }
+  }, [files, isReviewing, reviewQuery, token])
+
+  useEffect(() => {
+    if (!autoReviewOnOpen || !files.length || autoReviewStarted.current) return
+    autoReviewStarted.current = true
+    reviewDocuments()
+  }, [autoReviewOnOpen, files.length, reviewDocuments])
 
   return (
     <div

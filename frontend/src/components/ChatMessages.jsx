@@ -5,6 +5,7 @@ import StreamLoader from './StreamLoader'
 import sanitizeStreamText from '../utils/sanitizeStreamText'
 
 function formatFileSize(size) {
+  if (!Number.isFinite(size) || size <= 0) return ''
   if (size < 1024 * 1024) return `${Math.max(1, Math.round(size / 1024))} KB`
   return `${(size / (1024 * 1024)).toFixed(1)} MB`
 }
@@ -170,6 +171,7 @@ async function copyTextToClipboard(text) {
 export default function ChatMessages({ messages, error, onAssistantProgress }) {
   const [nextAssistantIndex, setNextAssistantIndex] = useState(0)
   const [copiedMessageId, setCopiedMessageId] = useState(null)
+  const [highlightedMessages, setHighlightedMessages] = useState(() => new Set())
   const completeTyping = useCallback((index) => {
     setNextAssistantIndex(index + 1)
   }, [])
@@ -225,6 +227,12 @@ export default function ChatMessages({ messages, error, onAssistantProgress }) {
           && !message.instant
           && !message.loading
           && index === activeAssistantIndex
+        const contentKey = `${messageKey}-${String(message.content ?? '').length}-${String(message.content ?? '').slice(0, 24)}-${String(message.content ?? '').slice(-24)}`
+        const isHighlighted = highlightedMessages.has(contentKey)
+        const isAnswerReady = message.role === 'assistant'
+          && !message.loading
+          && !message.streaming
+          && (message.instant || index < nextAssistantIndex)
         const content = typeof message.content === 'string' && message.role === 'assistant'
           ? sanitizeStreamText(message.content)
           : message.content
@@ -233,6 +241,12 @@ export default function ChatMessages({ messages, error, onAssistantProgress }) {
             <div className="bubble-wrap">
               <div className="bubble">
                 {message.agent ? <div className="agent-name">{message.agent}</div> : null}
+                {message.mostImportant ? (
+                  <section className="most-important-takeaway" aria-label="Most important takeaway">
+                    <div className="most-important-label">Most important</div>
+                    <p>{message.mostImportant}</p>
+                  </section>
+                ) : null}
                 {message.attachments?.length ? (
                   <div className="message-attachments">
                     {message.attachments.map((attachment) => (
@@ -245,6 +259,9 @@ export default function ChatMessages({ messages, error, onAssistantProgress }) {
                           <span className="message-attachment-icon" aria-hidden="true">FILE</span>
                         )}
                         <span className="message-attachment-name" title={attachment.name}>{attachment.name}</span>
+                        {attachment.camera_snapshot ? (
+                          <span className="message-camera-captured">Camera frame captured</span>
+                        ) : null}
                         <span className="message-attachment-size">{formatFileSize(attachment.size)}</span>
                       </div>
                     ))}
@@ -267,6 +284,7 @@ export default function ChatMessages({ messages, error, onAssistantProgress }) {
                     content={message.content}
                     role={message.agentRole}
                     uiData={message.uiData}
+                    highlightCore={isHighlighted}
                   />
                 )}
                 {message.role === 'assistant' ? (
@@ -287,40 +305,64 @@ export default function ChatMessages({ messages, error, onAssistantProgress }) {
                 <EvidenceLedger report={message.evidenceLedger} error={message.evidenceLedgerError} />
               ) : null}
 
-              {!message.instant ? (
+              {!message.instant || isAnswerReady ? (
                 <div className="message-actions" aria-label={`Actions for ${message.role} message`}>
-                  <button
-                    type="button"
-                    className="message-action"
-                    onClick={() => handleCopy(message, index)}
-                    aria-label={isCopied ? 'Copied to clipboard' : 'Copy message'}
-                    title={isCopied ? 'Copied' : 'Copy'}
-                  >
-                    {isCopied ? (
+                  {!message.instant ? (
+                    <>
+                      <button
+                        type="button"
+                        className="message-action"
+                        onClick={() => handleCopy(message, index)}
+                        aria-label={isCopied ? 'Copied to clipboard' : 'Copy message'}
+                        title={isCopied ? 'Copied' : 'Copy'}
+                      >
+                        {isCopied ? (
+                          <svg viewBox="0 0 20 20" aria-hidden="true">
+                            <path d="m4 10 4 4 8-8" />
+                          </svg>
+                        ) : (
+                          <svg viewBox="0 0 20 20" aria-hidden="true">
+                            <rect x="7" y="6" width="9" height="11" rx="1.5" />
+                            <path d="M12 6V4.5A1.5 1.5 0 0 0 10.5 3h-6A1.5 1.5 0 0 0 3 4.5v8A1.5 1.5 0 0 0 4.5 14H7" />
+                          </svg>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        className="message-action"
+                        onClick={() => handleShare(message, index)}
+                        aria-label="Share message"
+                        title="Share"
+                      >
+                        <svg viewBox="0 0 20 20" aria-hidden="true">
+                          <circle cx="15" cy="4" r="2" />
+                          <circle cx="5" cy="10" r="2" />
+                          <circle cx="15" cy="16" r="2" />
+                          <path d="m6.8 9 6.4-4M6.8 11l6.4 4" />
+                        </svg>
+                      </button>
+                    </>
+                  ) : null}
+                  {isAnswerReady ? (
+                    <button
+                      type="button"
+                      className={`message-action message-highlight-action${isHighlighted ? ' active' : ''}`}
+                      onClick={() => setHighlightedMessages((previous) => {
+                        const next = new Set(previous)
+                        if (next.has(contentKey)) next.delete(contentKey)
+                        else next.add(contentKey)
+                        return next
+                      })}
+                      aria-pressed={isHighlighted}
+                      aria-label={isHighlighted ? 'Hide key point highlights' : 'Highlight key points'}
+                      title={isHighlighted ? 'Hide key point highlights' : 'Highlight key points'}
+                    >
                       <svg viewBox="0 0 20 20" aria-hidden="true">
-                        <path d="m4 10 4 4 8-8" />
+                        <path d="m10 2 2.2 5.1 5.5.5-4.2 3.6 1.3 5.4-4.8-2.9-4.8 2.9 1.3-5.4L2.3 7.6l5.5-.5L10 2Z" />
                       </svg>
-                    ) : (
-                      <svg viewBox="0 0 20 20" aria-hidden="true">
-                        <rect x="7" y="6" width="9" height="11" rx="1.5" />
-                        <path d="M12 6V4.5A1.5 1.5 0 0 0 10.5 3h-6A1.5 1.5 0 0 0 3 4.5v8A1.5 1.5 0 0 0 4.5 14H7" />
-                      </svg>
-                    )}
-                  </button>
-                  <button
-                    type="button"
-                    className="message-action"
-                    onClick={() => handleShare(message, index)}
-                    aria-label="Share message"
-                    title="Share"
-                  >
-                    <svg viewBox="0 0 20 20" aria-hidden="true">
-                      <circle cx="15" cy="4" r="2" />
-                      <circle cx="5" cy="10" r="2" />
-                      <circle cx="15" cy="16" r="2" />
-                      <path d="m6.8 9 6.4-4M6.8 11l6.4 4" />
-                    </svg>
-                  </button>
+                      <span>{isHighlighted ? 'Hide highlights' : 'Highlight'}</span>
+                    </button>
+                  ) : null}
                 </div>
               ) : null}
             </div>

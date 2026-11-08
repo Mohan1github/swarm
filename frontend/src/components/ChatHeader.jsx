@@ -4,12 +4,11 @@ export default function ChatHeader({
   onAssistantModeChange,
   researchMode,
   onResearchModeChange,
-  onOpenDocumentReviewer,
+  observerEnabled,
+  observerPending,
+  onObserverToggle,
   isRunning,
-  onShowContextGraph,
-  onBackToChat,
   onLogout,
-  onReset,
 }) {
   return (
     <header className="chat-header">
@@ -49,29 +48,23 @@ export default function ChatHeader({
             </svg>
             <span>Research</span>
           </button>
-          {researchMode ? (
-            <button
-              className="document-reviewer-trigger"
-              type="button"
-              disabled={isRunning}
-              onClick={onOpenDocumentReviewer}
-            >
-              Documents
-            </button>
-          ) : null}
           </>
         ) : null}
+        {activePage === 'chat' ? (
+          <button
+            className={`observer-mode-button ${observerEnabled ? 'active' : ''}`}
+            type="button"
+            aria-pressed={observerEnabled}
+            disabled={observerPending || isRunning}
+            onClick={onObserverToggle}
+            title="Build private context for this chat session"
+          >
+            <span className="observer-button-signal" aria-hidden="true"><i /></span>
+            <span>{observerPending ? 'Starting…' : observerEnabled ? 'Observer on' : 'Observer'}</span>
+          </button>
+        ) : null}
         <nav className="header-nav-tools" aria-label="Workspace actions">
-          {activePage === 'contextGraph' ? (
-            <button className="ghost-button" type="button" onClick={onBackToChat}>Back to chat</button>
-          ) : (
-            <button className="ghost-button" type="button" onClick={onShowContextGraph}>Context graph</button>
-          )}
-          <button className="ghost-button" type="button">Share</button>
-          {activePage === 'chat' ? (
-            <button className="ghost-button" type="button" onClick={onReset}>New task</button>
-          ) : null}
-          <button className="ghost-button" type="button" onClick={onLogout}>Sign out</button>
+          <button className="ghost-button chat-header-signout" type="button" onClick={onLogout}>Sign out</button>
         </nav>
       </div>
     </header>

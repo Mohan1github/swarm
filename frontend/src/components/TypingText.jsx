@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 
-export default function TypingText({ text, speed = 700, onComplete, completionValue, onProgress }) {
+export default function TypingText({
+  text,
+  speed = 700,
+  onComplete,
+  completionValue,
+  onProgress,
+}) {
   const [visible, setVisible] = useState('')
   const lastProgressStep = useRef(-1)
 

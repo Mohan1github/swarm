@@ -12,6 +12,8 @@ export const stageOrder = [
   'synthesizer',
   'query_focus',
   'response_summarizer',
+  'cognitive_character',
+  'most_important',
   'validator',
 ]
 
@@ -29,6 +31,8 @@ export const stageLabels = {
   synthesizer: 'Synthesizer revision',
   query_focus: 'Query focus',
   response_summarizer: 'Response summarizer',
+  cognitive_character: 'Cognitive synthesis',
+  most_important: 'Most important takeaway',
   validator: 'Validator',
 }
 

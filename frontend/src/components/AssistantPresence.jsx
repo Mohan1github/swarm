@@ -28,6 +28,8 @@ export default function AssistantPresence({ isListening, isThinking, isSpeaking,
     <section className={`assistant-presence ${state}`} aria-label={`Assistant ${label.toLowerCase()}`}>
       <div className="assistant-visual" style={visualMotion} aria-hidden="true">
         <svg viewBox="0 0 320 220">
+          <circle className="assistant-aura aura-outer" cx="160" cy="110" r="104" />
+          <circle className="assistant-aura aura-inner" cx="160" cy="110" r="96" />
           <circle className="assistant-orbit orbit-wide" cx="160" cy="110" r="86" />
           <circle className="assistant-orbit orbit-tight" cx="160" cy="110" r="62" />
           {NEURAL_NODES.map(([x, y], index) => (

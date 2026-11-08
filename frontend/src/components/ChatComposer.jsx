@@ -6,6 +6,8 @@ export default function ChatComposer({
   attachments,
   attachmentError,
   isRunning,
+  researchMode = false,
+  onOpenDocumentReviewer,
   isActive = true,
   voiceState,
   onVoiceStateChange,
@@ -167,6 +169,22 @@ export default function ChatComposer({
           >
             +
           </button>
+          {researchMode ? (
+            <button
+              className="composer-document-mode-trigger"
+              type="button"
+              disabled={isRunning}
+              aria-label="Open document reviewer"
+              title="Review supporting documents"
+              onClick={onOpenDocumentReviewer}
+            >
+              <svg viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M5 2.5h6l4 4v11H5z" />
+                <path d="M11 2.5v4h4M7.5 10h5M7.5 13h5" />
+              </svg>
+              <span>Docs</span>
+            </button>
+          ) : null}
           <textarea
             className={isRunning ? 'composer-loading' : ''}
             value={query}

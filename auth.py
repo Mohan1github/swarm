@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import secrets
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -47,6 +49,27 @@ def _connect() -> sqlite3.Connection:
             role TEXT NOT NULL DEFAULT 'user',
             token_version INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS google_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            google_sub TEXT NOT NULL UNIQUE,
+            email TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            token_version INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS google_login_nonces (
+            nonce_hash TEXT PRIMARY KEY,
+            expires_at REAL NOT NULL,
+            consumed_at REAL
         )
         """
     )
@@ -100,7 +123,19 @@ def get_user_by_email(email: str) -> tuple[AuthUser | None, str | None]:
 def get_user_by_id(user_id: int) -> AuthUser | None:
     connection = _connect()
     try:
-        row = connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if user_id < 0:
+            row = connection.execute(
+                """
+                SELECT -id AS id, email, role, token_version
+                FROM google_accounts WHERE id = ?
+                """,
+                (-user_id,),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT * FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
         return _user_from_row(row)
     finally:
         connection.close()
@@ -113,6 +148,85 @@ def authenticate_user(email: str, password: str) -> AuthUser | None:
     except Exception:
         password_matches = False
     return user if user is not None and password_matches else None
+
+
+def create_google_login_nonce() -> str:
+    nonce = secrets.token_urlsafe(32)
+    now = time.time()
+    connection = _connect()
+    try:
+        connection.execute("DELETE FROM google_login_nonces WHERE expires_at <= ?", (now,))
+        connection.execute(
+            "INSERT INTO google_login_nonces (nonce_hash, expires_at) VALUES (?, ?)",
+            (hashlib.sha256(nonce.encode("utf-8")).hexdigest(), now + 300),
+        )
+        connection.commit()
+        return nonce
+    finally:
+        connection.close()
+
+
+def consume_google_login_nonce(nonce: str) -> bool:
+    nonce_hash = hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+    connection = _connect()
+    try:
+        cursor = connection.execute(
+            """
+            UPDATE google_login_nonces SET consumed_at = ?
+            WHERE nonce_hash = ? AND consumed_at IS NULL AND expires_at > ?
+            """,
+            (time.time(), nonce_hash, time.time()),
+        )
+        connection.commit()
+        return cursor.rowcount == 1
+    finally:
+        connection.close()
+
+
+def authenticate_google_user(email: str, google_sub: str) -> AuthUser | None:
+    normalized_email = email.strip().lower()
+    connection = _connect()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        account_row = connection.execute(
+            "SELECT * FROM google_accounts WHERE google_sub = ?",
+            (google_sub,),
+        ).fetchone()
+        if account_row is not None:
+            connection.commit()
+            return AuthUser(
+                id=-account_row["id"],
+                email=account_row["email"],
+                role=account_row["role"],
+                token_version=account_row["token_version"],
+            )
+        cursor = connection.execute(
+            "INSERT INTO google_accounts (google_sub, email) VALUES (?, ?)",
+            (google_sub, normalized_email),
+        )
+        connection.commit()
+        return AuthUser(
+            id=-cursor.lastrowid,
+            email=normalized_email,
+            role="user",
+            token_version=0,
+        )
+    except sqlite3.IntegrityError:
+        connection.rollback()
+        row = connection.execute(
+            "SELECT * FROM google_accounts WHERE google_sub = ?",
+            (google_sub,),
+        ).fetchone()
+        if row is not None:
+            return AuthUser(
+                id=-row["id"],
+                email=row["email"],
+                role=row["role"],
+                token_version=row["token_version"],
+            )
+        return None
+    finally:
+        connection.close()
 
 
 def create_access_token(user: AuthUser) -> str:
@@ -132,10 +246,16 @@ def create_access_token(user: AuthUser) -> str:
 def revoke_user_tokens(user_id: int) -> None:
     connection = _connect()
     try:
-        connection.execute(
-            "UPDATE users SET token_version = token_version + 1 WHERE id = ?",
-            (user_id,),
-        )
+        if user_id < 0:
+            connection.execute(
+                "UPDATE google_accounts SET token_version = token_version + 1 WHERE id = ?",
+                (-user_id,),
+            )
+        else:
+            connection.execute(
+                "UPDATE users SET token_version = token_version + 1 WHERE id = ?",
+                (user_id,),
+            )
         connection.commit()
     finally:
         connection.close()

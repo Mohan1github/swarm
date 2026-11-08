@@ -55,6 +55,19 @@ export function AuthProvider({ children }) {
     setIsLoading(false)
   }
 
+  const authenticateWithGoogle = async (credential, nonce) => {
+    const response = await fetch('/api/auth/google', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ credential, nonce }),
+    })
+    const payload = await readResponse(response)
+    sessionStorage.setItem(TOKEN_KEY, payload.access_token)
+    setToken(payload.access_token)
+    setUser(payload.user)
+    setIsLoading(false)
+  }
+
   const login = (email, password) => authenticate('/api/auth/login', email, password)
   const register = (email, password) => authenticate('/api/auth/register', email, password)
 
@@ -78,7 +91,15 @@ export function AuthProvider({ children }) {
   }
 
   return (
-    <AuthContext.Provider value={{ token, user, isLoading, login, register, logout }}>
+    <AuthContext.Provider value={{
+      token,
+      user,
+      isLoading,
+      login,
+      register,
+      authenticateWithGoogle,
+      logout,
+    }}>
       {children}
     </AuthContext.Provider>
   )

@@ -3,7 +3,12 @@ import { initialMessages, stageLabels } from '../constants/workflow'
 import formatAgentOutput from '../utils/formatAgentOutput'
 import serializeAttachment from '../utils/serializeAttachment'
 
-export default function useSwarmStream({ token }) {
+export default function useSwarmStream({
+  token,
+  observerEnabled = false,
+  observerSessionId = null,
+  onObserverResult,
+}) {
   const [status, setStatus] = useState('Ready')
   const [isRunning, setIsRunning] = useState(false)
   const [steps, setSteps] = useState([])
@@ -43,6 +48,17 @@ export default function useSwarmStream({ token }) {
     event?.preventDefault()
     const trimmed = query.trim()
     if (!trimmed || isRunning) return
+    const conversationHistory = messages
+      .filter((message) => (
+        (message.role === 'user' || message.role === 'assistant')
+        && typeof message.content === 'string'
+        && !message.loading
+      ))
+      .slice(-8)
+      .map(({ role, content }) => ({
+        role,
+        content: content.slice(-2000),
+      }))
 
     setIsRunning(true)
     setStatus(attachments.length ? 'Preparing attachments...' : 'Connecting to live swarm...')
@@ -63,7 +79,35 @@ export default function useSwarmStream({ token }) {
     let streamClosed = false
     const stepMap = new Map()
     const trace = []
+    const observeTurn = (answer) => {
+      if (observerEnabled && observerSessionId && answer) {
+        onObserverResult?.(trimmed, answer)
+      }
+    }
     const handlePayload = (payload) => {
+      if (payload.type === 'clarification_required') {
+        if (streamClosed) return
+        streamClosed = true
+        setStatus('Needs a little more context')
+        setActiveStage(null)
+        setIsRunning(false)
+        setSteps([])
+        setMessages((previous) => {
+          const last = previous[previous.length - 1]
+          const withoutPlaceholder = last?.role === 'assistant' && last.loading
+            ? previous.slice(0, -1)
+            : previous
+          return [...withoutPlaceholder, {
+            role: 'assistant',
+            agentRole: 'clarification',
+            content: payload.question || 'What matters most to you about this request?',
+            missingInformation: payload.missing_information || [],
+          }]
+        })
+        observeTurn(payload.question || '')
+        return
+      }
+
       if (payload.type === 'setup') {
         setSelectedAgents(payload.selected_agents ?? 0)
         setStatus('Selecting specialist agents')
@@ -74,6 +118,7 @@ export default function useSwarmStream({ token }) {
         if (streamClosed) return
         streamClosed = true
         const cachedAnswer = formatAgentOutput(payload.answer, 'synthesizer') || 'No cached answer found.'
+        observeTurn(cachedAnswer)
         const cachedSteps = payload.steps || []
         setStatus('Instant answer from vector cache')
         setSteps(cachedSteps)
@@ -152,15 +197,27 @@ export default function useSwarmStream({ token }) {
         setStatus('Workflow complete')
         setActiveStage(null)
         const finalAnswer = formatAgentOutput(payload.answer, 'synthesizer') || 'No answer generated.'
+        observeTurn(finalAnswer)
         setMessages((previous) => {
-          const last = previous[previous.length - 1]
+          let conversationStart = 0
+          if (payload.route?.conversation_reset) {
+            for (let index = previous.length - 1; index >= 0; index -= 1) {
+              if (previous[index].role === 'user' && previous[index].content === trimmed) {
+                conversationStart = index
+                break
+              }
+            }
+          }
+          const conversation = previous.slice(conversationStart)
+          const last = conversation[conversation.length - 1]
           const withoutPlaceholder = last?.role === 'assistant' && last.loading
-            ? previous.slice(0, -1)
-            : previous
+            ? conversation.slice(0, -1)
+            : conversation
           return [...withoutPlaceholder, {
             role: 'assistant',
             agentRole: 'final',
             content: finalAnswer,
+            mostImportant: payload.most_important || '',
             evidenceLedger: payload.evidence_ledger ?? null,
             evidenceLedgerError: payload.evidence_ledger_error ?? '',
             imageSources: payload.image_sources ?? [],
@@ -213,6 +270,7 @@ export default function useSwarmStream({ token }) {
         body: JSON.stringify({
           query: trimmed,
           research_mode: researchMode,
+          conversation_history: conversationHistory,
           attachments: serializedAttachments.map(({ name, media_type, content }) => ({
             name,
             media_type,

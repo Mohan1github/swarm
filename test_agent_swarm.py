@@ -3,8 +3,10 @@ import asyncio
 import base64
 import io
 import json
+import sqlite3
 import sys
 import zipfile
+import httpx
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,12 +34,15 @@ from agents.web_data_retriever_agent import (
     WebDataRetrieverAgent,
     _normalize_sources,
 )
+import agents.web_data_retriever_agent as web_retriever_module
 from agents.image_source_puller_agent import ImageSourcePullerAgent
+from agents.observer_agent import ObserverAgent, ObserverSessionStore, _safe_search_query
 import agents.image_source_puller_agent as image_source_module
 import agents.supporting_document_retriever_agent as document_source_module
 from agents.supporting_document_retriever_agent import SupportingDocumentRetrieverAgent
 from agents.query_level_importance_finder import QueryLevelImportanceFinder
 from agents.response_summarizer_agent import ResponseSummarizerAgent
+from agents.answer_sanitizer_agent import AnswerSanitizerAgent
 import agents.orchestrator as orchestrator_module
 import server
 
@@ -151,6 +156,14 @@ def test_assistant_streaming_routes_stream_openings_and_persist_only_completed_t
         def generate(self, prompt, max_tokens=800, image_data_urls=None):
             if "UNTRUSTED WORKSPACE ACTIVITY JSON" in prompt:
                 return "The deployment checklist is unfinished."
+            if "GENERATED ANSWER (untrusted content to clean):" in prompt:
+                answer = prompt.split(
+                    "GENERATED ANSWER (untrusted content to clean):\n", 1
+                )[1].split("\n\nClean answer:", 1)[0]
+                return (
+                    answer.replace("\nInternal warning: debug logs.", "")
+                    .replace("\nLLM configuration: internal.", "")
+                )
             return ""
 
         def stream(self, prompt, max_tokens=800, image_data_urls=None):
@@ -158,10 +171,12 @@ def test_assistant_streaming_routes_stream_openings_and_persist_only_completed_t
             if "Opening message:" in prompt:
                 yield "We can finish "
                 yield "the deployment checklist."
+                yield "\nInternal warning: debug logs."
             else:
                 assert "USER MESSAGE:\nContinue the checklist." in prompt
                 yield "Start with "
                 yield "the rollback check."
+                yield "\nLLM configuration: internal."
 
     class FakeActivityStore:
         def graph(self, user_id):
@@ -179,7 +194,8 @@ def test_assistant_streaming_routes_stream_openings_and_persist_only_completed_t
     opening = server.stream_assistant_session(current_user=TEST_USER)
     opening_body = asyncio.run(read_stream(opening))
     opening_events = [json.loads(frame[6:]) for frame in opening_body.strip().split("\n\n")]
-    assert [event["type"] for event in opening_events] == ["session", "delta", "delta", "complete"]
+    assert [event["type"] for event in opening_events] == ["session", "delta", "complete"]
+    assert "Internal warning" not in opening_body
     assert memory.load_workspace_context(TEST_USER.id) == ""
     assert memory.load(TEST_USER.id) == (
         [{"role": "assistant", "content": "We can finish the deployment checklist."}],
@@ -193,7 +209,8 @@ def test_assistant_streaming_routes_stream_openings_and_persist_only_completed_t
     )
     reply_body = asyncio.run(read_stream(reply))
     reply_events = [json.loads(frame[6:]) for frame in reply_body.strip().split("\n\n")]
-    assert [event["type"] for event in reply_events] == ["delta", "delta", "complete"]
+    assert [event["type"] for event in reply_events] == ["delta", "complete"]
+    assert "LLM configuration" not in reply_body
     assert reply_events[-1]["memory_turn_count"] == 3
     assert memory.load(TEST_USER.id)[0] == [
         {"role": "assistant", "content": "We can finish the deployment checklist."},
@@ -210,6 +227,11 @@ def test_assistant_proactive_stream_route_uses_and_persists_private_context(monk
 
     class FakeLLM:
         enabled = True
+
+        def generate(self, prompt, max_tokens=800):
+            return prompt.split(
+                "GENERATED ANSWER (untrusted content to clean):\n", 1
+            )[1].split("\n\nClean answer:", 1)[0]
 
         def stream(self, prompt, max_tokens=800):
             prompts.append(prompt)
@@ -260,7 +282,7 @@ def test_assistant_streaming_error_does_not_persist_partial_reply(monkeypatch, t
 
     body = asyncio.run(read_stream())
     events = [json.loads(frame[6:]) for frame in body.strip().split("\n\n")]
-    assert [event["type"] for event in events] == ["delta", "error"]
+    assert [event["type"] for event in events] == ["error"]
     assert memory.load(TEST_USER.id) == ([], 0)
 
 
@@ -317,6 +339,10 @@ def test_assistant_api_persists_turns_per_authenticated_user(tmp_path, monkeypat
 
         def generate(self, prompt, max_tokens=800, image_data_urls=None):
             llm_prompts.append(prompt)
+            if "GENERATED ANSWER (untrusted content to clean):" in prompt:
+                return prompt.split(
+                    "GENERATED ANSWER (untrusted content to clean):\n", 1
+                )[1].split("\n\nClean answer:", 1)[0]
             if "UNTRUSTED WORKSPACE ACTIVITY JSON" in prompt:
                 assert "Prepare the launch rollout" in prompt
                 return "The launch rollout is the current focus."
@@ -708,6 +734,35 @@ def test_web_retrieval_persists_vectors_and_graph_per_user(tmp_path):
     )
 
 
+def test_web_retrieval_returns_live_sources_if_dense_index_fails(tmp_path):
+    class FakeSearch:
+        def invoke(self, _payload):
+            return {
+                "results": [{
+                    "title": "Public source",
+                    "url": "https://example.com/public-source",
+                    "content": "Current public source text with enough detail to use as evidence. " * 2,
+                }],
+            }
+
+    class FailingEmbeddings:
+        def embed_query(self, _query):
+            raise RuntimeError("local embedding model unavailable")
+
+    agent = WebDataRetrieverAgent(
+        search_tool=FakeSearch(),
+        embeddings=FailingEmbeddings(),
+        store=PersistentWebVectorGraph(tmp_path / "web-index-failure.sqlite3"),
+    )
+
+    sources = agent.retrieve(74, "latest public report")
+
+    assert len(sources) == 1
+    assert sources[0]["url"] == "https://example.com/public-source"
+    assert "without local indexing" in sources[0]["retrieval_warning"]
+    assert "RETRIEVAL NOTE:" in web_retriever_module.format_research_context(sources)
+
+
 def test_web_retrieval_stage_is_only_added_to_reasoning_route(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_OUTPUT_VECTOR_DB_PATH", str(tmp_path / "web-workflow-vectors.sqlite3"))
     prompts = []
@@ -780,34 +835,121 @@ def test_web_retrieval_stage_is_only_added_to_reasoning_route(monkeypatch, tmp_p
     assert events[-1]["answer"].endswith("https://example.com/report")
 
 
-def test_web_retrieval_without_provider_key_fails_explicitly(monkeypatch, tmp_path):
+def test_web_retrieval_without_tavily_uses_duckduckgo_fallback(monkeypatch, tmp_path):
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
-    monkeypatch.setenv("WEB_RESEARCH_DB_PATH", str(tmp_path / "web-config.sqlite3"))
+    queries = []
 
-    class FakeLLM:
-        enabled = True
-        model = "test-model"
+    class FakeDDGS:
+        def text(self, query, max_results):
+            queries.append((query, max_results))
+            return [{
+                "title": "Public report",
+                "href": "https://example.com/report",
+                "body": "A detailed public report describing the current evidence and recent findings.",
+            }]
 
-        def generate(self, prompt, max_tokens=800, image_data_urls=None):
-            if "query level and importance finder" in prompt:
-                return json.dumps({
-                    "route": "reasoning",
-                    "importance": 5,
-                    "reason": "Needs live evidence.",
-                    "requires_web_search": True,
-                    "search_topic": "general",
-                })
-            raise AssertionError("Web search configuration should fail before other model stages.")
+    monkeypatch.setitem(sys.modules, "ddgs", SimpleNamespace(DDGS=FakeDDGS))
+    monkeypatch.setattr(web_retriever_module, "_is_public_source_url", lambda _url: True)
+    monkeypatch.setattr(
+        web_retriever_module,
+        "_scrape_public_page",
+        lambda _url: ("Public report", "A detailed public report describing the current evidence and recent findings."),
+    )
+    agent = WebDataRetrieverAgent(search_tool=None)
 
-    engine = module.ReasoningSwarmEngine(total_agents=1)
-    engine.llm = FakeLLM()
-    events = list(engine.iter_workflow("Research the latest public evidence.", user_id=73))
+    sources = agent._search_text({
+        "query": "Research the latest public evidence.",
+        "search_topic": "general",
+    })["fetched_sources"]
 
-    assert events[-1] == {
-        "type": "error",
-        "stage": "web_retriever",
-        "message": "Live web retrieval requires TAVILY_API_KEY.",
-    }
+    assert queries == [("Research the latest public evidence.", web_retriever_module.MAX_RESULTS)]
+    assert len(sources) == 1
+    assert sources[0]["url"] == "https://example.com/report"
+    assert "current evidence" in sources[0]["content"]
+
+
+def test_tavily_failure_uses_duckduckgo_and_bounded_page_text(monkeypatch):
+    class BrokenTavily:
+        def invoke(self, _payload):
+            raise RuntimeError("search provider unavailable")
+
+    class FakeDDGS:
+        def text(self, _query, max_results):
+            assert max_results == web_retriever_module.MAX_RESULTS
+            return [{
+                "title": "Search result",
+                "href": "https://example.com/result",
+                "body": "A useful search result snippet with enough text to normalize.",
+            }]
+
+    monkeypatch.setitem(sys.modules, "ddgs", SimpleNamespace(DDGS=FakeDDGS))
+    monkeypatch.setattr(web_retriever_module, "_is_public_source_url", lambda _url: True)
+    monkeypatch.setattr(
+        web_retriever_module,
+        "_scrape_public_page",
+        lambda _url: (
+            "Extracted title",
+            "Extracted page text with detailed public evidence and relevant findings. " * 2,
+        ),
+    )
+    sources = WebDataRetrieverAgent(search_tool=BrokenTavily())._search_text({
+        "query": "latest public evidence",
+        "search_topic": "general",
+    })["fetched_sources"]
+
+    assert len(sources) == 1
+    assert sources[0]["title"] == "Extracted title"
+    assert "detailed public evidence" in sources[0]["content"]
+
+
+def test_public_page_scraper_extracts_text_and_blocks_local_addresses(monkeypatch):
+    page = (
+        "<html><head><title>Public report</title><script>hidden secret</script></head>"
+        "<body><nav>Navigation text</nav><main>Useful public page text with evidence.</main>"
+        "<footer>Footer text</footer></body></html>"
+    )
+
+    class FakeResponse:
+        is_redirect = False
+        headers = {"content-type": "text/html; charset=utf-8"}
+        encoding = "utf-8"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield page.encode("utf-8")
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def stream(self, _method, _url):
+            return FakeResponse()
+
+    assert not web_retriever_module._is_public_source_url("http://127.0.0.1/")
+    monkeypatch.setattr(web_retriever_module.httpx, "Client", FakeClient)
+    monkeypatch.setattr(web_retriever_module, "_is_public_source_url", lambda _url: True)
+
+    title, content = web_retriever_module._scrape_public_page("https://example.com/report")
+
+    assert title == "Public report"
+    assert "Useful public page text with evidence." in content
+    assert "hidden secret" not in content
+    assert "Navigation text" not in content
+    assert "Footer text" not in content
 
 
 def test_workflow_stores_agent_outputs_and_summarizes_retrieved_matches(monkeypatch, tmp_path):
@@ -888,6 +1030,70 @@ def test_live_workflow_does_not_fall_back_after_provider_error():
     assert calls == 1
 
 
+def test_live_workflow_returns_public_sources_when_model_fails(monkeypatch):
+    source = {
+        "title": "Current public report",
+        "url": "https://example.com/current-report",
+        "published_date": "2026-11-04",
+        "fetched_at": "",
+        "related_query": "Research the latest public report.",
+        "content": "A public report with current findings and details. " * 2,
+    }
+
+    monkeypatch.setattr(
+        orchestrator_module.WebDataRetrieverAgent,
+        "search_public_sources",
+        lambda _agent, query: [{**source, "related_query": query}],
+    )
+
+    class FailingLLM:
+        enabled = True
+        model = "test-model"
+
+        def generate(self, prompt, max_tokens=800):
+            raise RuntimeError("provider unavailable")
+
+    engine = module.ReasoningSwarmEngine(total_agents=1)
+    engine.llm = FailingLLM()
+    events = list(engine.iter_workflow("Research the latest public report."))
+
+    assert events[-1]["type"] == "complete"
+    assert events[-1]["fallback_mode"] == "public_sources"
+    assert events[-1]["model"] == "web-sources-only"
+    assert "not an AI-generated summary" in events[-1]["answer"]
+    assert "https://example.com/current-report" in events[-1]["answer"]
+
+
+def test_web_fallback_does_not_search_attachment_or_private_queries(monkeypatch):
+    searches = []
+    monkeypatch.setattr(
+        orchestrator_module.WebDataRetrieverAgent,
+        "search_public_sources",
+        lambda _agent, query: searches.append(query) or [],
+    )
+
+    class FailingLLM:
+        enabled = True
+        model = "test-model"
+
+        def generate(self, prompt, max_tokens=800, image_data_urls=None):
+            raise RuntimeError("provider unavailable")
+
+    engine = module.ReasoningSwarmEngine(total_agents=1)
+    engine.llm = FailingLLM()
+    attachment_events = list(engine.iter_workflow(
+        "Research the latest public report.",
+        attachment_context="private attachment data",
+    ))
+    private_events = list(engine.iter_workflow(
+        "Research my account password and private details."
+    ))
+
+    assert searches == []
+    assert attachment_events[-1]["type"] == "error"
+    assert private_events[-1]["type"] == "error"
+
+
 def test_query_classifier_uses_json_mode_and_larger_token_budget():
     requests = []
 
@@ -910,6 +1116,79 @@ def test_query_classifier_uses_json_mode_and_larger_token_budget():
     assert result["decision"] == "direct"
     assert len(requests) == 1
     assert requests[0][1] == 512
+
+
+def test_query_classifier_uses_recent_history_to_detect_topic_reset():
+    prompts = []
+
+    class ContextClassifier:
+        def generate_json(self, prompt, max_tokens=800):
+            prompts.append(prompt)
+            return json.dumps({
+                "route": "direct",
+                "importance": 1,
+                "reason": "A simple follow-up.",
+                "requires_web_search": False,
+                "search_topic": "general",
+                "conversation_reset": False,
+            })
+
+    history = [
+        {"role": "user", "content": "Help me plan a safe deployment."},
+        {"role": "assistant", "content": "Use a canary release and monitor errors."},
+    ]
+    route = QueryLevelImportanceFinder(ContextClassifier()).classify(
+        "What metrics should I monitor?",
+        conversation_history=history,
+    )
+
+    assert "USER: Help me plan a safe deployment." in prompts[0]
+    assert "ASSISTANT: Use a canary release and monitor errors." in prompts[0]
+    assert "conversation_reset" in prompts[0]
+    assert route["conversation_reset"] is False
+
+
+def test_workflow_uses_history_for_followup_and_drops_it_after_domain_reset():
+    history = [
+        {"role": "user", "content": "Help me plan a safe deployment."},
+        {"role": "assistant", "content": "Use a canary release and monitor errors."},
+    ]
+    answer_prompts = []
+
+    class ContextAwareLLM:
+        enabled = True
+        model = "test-model"
+
+        def generate(self, prompt, max_tokens=800, image_data_urls=None):
+            if "query level and importance finder" in prompt:
+                reset = "new unrelated topic" in prompt
+                return json.dumps({
+                    "route": "direct",
+                    "importance": 1,
+                    "reason": "Simple request.",
+                    "requires_web_search": False,
+                    "search_topic": "general",
+                    "conversation_reset": reset,
+                })
+            answer_prompts.append(prompt)
+            return "Answer."
+
+    engine = module.ReasoningSwarmEngine(total_agents=1)
+    engine.llm = ContextAwareLLM()
+
+    continuation_events = list(engine.iter_workflow(
+        "What metrics should I monitor?",
+        conversation_history=history,
+    ))
+    reset_events = list(engine.iter_workflow(
+        "This is a new unrelated topic about cooking.",
+        conversation_history=history,
+    ))
+
+    assert continuation_events[-1]["route"]["conversation_reset"] is False
+    assert "Use a canary release and monitor errors." in answer_prompts[0]
+    assert reset_events[-1]["route"]["conversation_reset"] is True
+    assert "Use a canary release and monitor errors." not in answer_prompts[1]
 
 
 def test_query_classifier_retries_invalid_json_response():
@@ -954,6 +1233,7 @@ def test_query_classifier_reports_invalid_response_after_retry():
         "reason": "Classifier output was unavailable; using the reasoning workflow.",
         "requires_web_search": False,
         "search_topic": "general",
+        "conversation_reset": False,
         "classification_fallback": True,
     }
 
@@ -975,6 +1255,7 @@ def test_query_classifier_accepts_integral_json_number_and_surrounding_text():
         "reason": "Needs research.",
         "requires_web_search": False,
         "search_topic": "general",
+        "conversation_reset": False,
     }
 
 
@@ -1022,6 +1303,7 @@ def test_query_classifier_normalizes_string_importance_and_optional_reason():
         "reason": "",
         "requires_web_search": False,
         "search_topic": "general",
+        "conversation_reset": False,
     }
 
 
@@ -1540,7 +1822,14 @@ def test_live_graph_uses_actual_stage_and_validation_data():
 
 def test_api_response_contains_live_execution_results(monkeypatch):
     class FakeEngine:
-        llm = type("FakeLLM", (), {"enabled": True})()
+        llm = type(
+            "FakeLLM",
+            (),
+            {
+                "enabled": True,
+                "generate": lambda self, prompt, max_tokens=800: "Model-generated final answer.",
+            },
+        )()
 
         def __init__(self, total_agents):
             self.total_agents = total_agents
@@ -1596,44 +1885,87 @@ def test_api_response_contains_live_execution_results(monkeypatch):
     assert response.supporting_documents[0]["title"] == "Field study"
 
 
-def test_api_rejects_requests_without_live_provider(monkeypatch):
-    class DisabledEngine:
-        llm = type("DisabledLLM", (), {"enabled": False})()
+def test_api_accepts_public_source_fallback_without_live_provider(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "ANSWER_CACHE", VectorAnswerCache(tmp_path / "fallback-cache.sqlite3"))
+    monkeypatch.setattr(
+        server,
+        "ACTIVITY_STORE",
+        UserActivityStore(tmp_path / "fallback-activity.sqlite3"),
+    )
+    engine = module.ReasoningSwarmEngine(total_agents=1)
+    engine.llm = SimpleNamespace(enabled=False, model="test-model")
+    monkeypatch.setattr(server, "ReasoningSwarmEngine", lambda total_agents: engine)
+    monkeypatch.setattr(
+        orchestrator_module.WebDataRetrieverAgent,
+        "search_public_sources",
+        lambda _agent, query: [{
+            "title": "Public report",
+            "url": "https://example.com/public-report",
+            "published_date": "",
+            "fetched_at": "",
+            "related_query": query,
+            "content": "Directly retrieved public sources with useful text. " * 2,
+        }],
+    )
 
-        def __init__(self, total_agents):
-            self.total_agents = total_agents
+    response = server.run_swarm_query(
+        server.QueryRequest(query="Research the latest public report."),
+        _current_user=TEST_USER,
+    )
 
-    monkeypatch.setattr(server, "ReasoningSwarmEngine", DisabledEngine)
-
-    try:
-        server.run_swarm_query(
-            server.QueryRequest(query="Must use a live provider"),
-            _current_user=TEST_USER,
-        )
-    except server.HTTPException as error:
-        assert error.status_code == 503
-    else:
-        raise AssertionError("API must not return a simulated response without an LLM")
+    assert response.mode == "web_sources_fallback"
+    assert response.workflow_mode == "web_sources_fallback"
+    assert response.model == "web-sources-only"
+    assert response.top_action == "summarize"
+    assert "https://example.com/public-report" in response.answer
 
 
 def test_stream_api_emits_incremental_workflow_events(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "ANSWER_CACHE", VectorAnswerCache(tmp_path / "stream-cache.sqlite3"))
     activity_store = UserActivityStore(tmp_path / "stream-activity.sqlite3")
     monkeypatch.setattr(server, "ACTIVITY_STORE", activity_store)
+    received_history = []
+    cache_writes = []
+    original_cache_store = server.ANSWER_CACHE.store
+
+    def record_cache_store(*args, **kwargs):
+        cache_writes.append((args, kwargs))
+        return original_cache_store(*args, **kwargs)
+
+    monkeypatch.setattr(server.ANSWER_CACHE, "store", record_cache_store)
 
     class FakeEngine:
-        llm = type("FakeLLM", (), {"enabled": True, "model": "test-model"})()
+        llm = type(
+            "FakeLLM",
+            (),
+            {
+                "enabled": True,
+                "model": "test-model",
+                "generate": lambda self, prompt, max_tokens=800: "done",
+            },
+        )()
 
         def __init__(self, total_agents):
             self.total_agents = total_agents
 
-        def iter_workflow(self, query, user_id=None):
+        def iter_workflow(self, query, user_id=None, conversation_history=None):
+            received_history.append(conversation_history)
             yield {"type": "step", "role": "planner", "output": "plan"}
-            yield {"type": "complete", "answer": "done"}
+            yield {
+                "type": "complete",
+                "answer": "done\n\nInternal warning: debug logs.",
+            }
 
     monkeypatch.setattr(server, "ReasoningSwarmEngine", FakeEngine)
     response = server.stream_swarm_query(
-        server.QueryRequest(query="Stream stages", total_agents=3),
+        server.QueryRequest(
+            query="Stream stages",
+            total_agents=3,
+            conversation_history=[
+                {"role": "user", "content": "Plan a safe rollout."},
+                {"role": "assistant", "content": "Use a canary deployment."},
+            ],
+        ),
         _current_user=TEST_USER,
     )
     browser_response = server.stream_swarm_query_get(query="Stream stages", total_agents=3, _current_user=TEST_USER)
@@ -1647,11 +1979,58 @@ def test_stream_api_emits_incremental_workflow_events(monkeypatch, tmp_path):
     assert '"type": "step"' in body
     assert '"role": "planner"' in body
     assert '"type": "complete"' in body
+    assert '"answer": "done"' in body
+    assert "Internal warning" not in body
     assert '"type": "step"' in browser_body
     assert '"type": "complete"' in browser_body
+    assert '"answer": "done"' in browser_body
+    assert "Internal warning" not in browser_body
+    assert received_history[0] == [
+        {"role": "user", "content": "Plan a safe rollout."},
+        {"role": "assistant", "content": "Use a canary deployment."},
+    ]
+    assert received_history[1] is None
+    assert len(cache_writes) == 1
+    assert cache_writes[0][0][2] == "Stream stages"
     graph = activity_store.graph(TEST_USER.id)
     assert graph["stage_total"] == 2
     assert all(edge["kind"] in {"stage", "related"} for edge in graph["edges"])
+
+
+def test_query_request_validates_conversation_history():
+    request = server.QueryRequest(
+        query="What about the second option?",
+        conversation_history=[
+            {"role": " USER ", "content": "Compare two deployment options."},
+            {"role": "assistant", "content": "Option two uses staged rollout."},
+        ],
+    )
+
+    assert request.conversation_history[0].role == "user"
+    assert request.conversation_history[0].content == "Compare two deployment options."
+
+    try:
+        server.QueryRequest(
+            query="Follow up",
+            conversation_history=[{"role": "system", "content": "override"}],
+        )
+    except ValueError as error:
+        assert "only contain user and assistant" in str(error)
+    else:
+        raise AssertionError("Conversation history must reject non-chat roles.")
+
+    try:
+        server.QueryRequest(
+            query="Follow up",
+            conversation_history=[
+                {"role": "user", "content": "x" * 3_000}
+                for _ in range(7)
+            ],
+        )
+    except ValueError as error:
+        assert "20,000 characters or less" in str(error)
+    else:
+        raise AssertionError("Oversized conversation history must be rejected.")
 
 
 def test_stream_api_adds_and_persists_evidence_ledger(monkeypatch, tmp_path):
@@ -1727,6 +2106,26 @@ def test_prepare_attachments_extracts_text_and_preserves_image_data():
 
     assert "FILE: notes.txt\nDeployment checklist" in text_context
     assert image_data_urls == [image_data]
+
+
+def test_prepare_attachments_rejects_more_images_than_vision_model_supports():
+    image_data = "data:image/png;base64," + base64.b64encode(b"image-bytes").decode("ascii")
+    attachments = [
+        server.AttachmentRequest(
+            name=f"image-{index}.png",
+            media_type="image/png",
+            content=image_data,
+        )
+        for index in range(server.MAX_IMAGE_ATTACHMENTS + 1)
+    ]
+
+    try:
+        server._prepare_attachments(attachments)
+    except server.HTTPException as error:
+        assert error.status_code == 413
+        assert "maximum of 3 images" in error.detail
+    else:
+        raise AssertionError("Too many image attachments were accepted.")
 
 
 def test_prepare_attachments_extracts_docx_for_reviewer():
@@ -1893,7 +2292,11 @@ def test_research_mode_stream_bypasses_cache_and_forces_agent_workflow(monkeypat
     received = {}
 
     class FakeEngine:
-        llm = SimpleNamespace(enabled=True, model="test-model")
+        llm = SimpleNamespace(
+            enabled=True,
+            model="test-model",
+            generate=lambda prompt, max_tokens=800: "Research workflow response",
+        )
 
         def __init__(self, total_agents):
             pass
@@ -2004,6 +2407,21 @@ def test_clear_history_removes_all_user_history_without_affecting_other_users(tm
     vectors.store(2, "test-model", "run-two", "User two vector prompt", "researcher", "research", "User two output")
     web_store = PersistentWebVectorGraph(tmp_path / "clear-web-research.sqlite3")
     evidence_store = EvidenceLedgerStore(tmp_path / "clear-evidence-ledger.sqlite3")
+    class FakeEmbeddings:
+        def embed_documents(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+        def embed_query(self, text):
+            return [1.0, 0.0]
+
+    observer_store = ObserverSessionStore(
+        tmp_path / "clear-observer.sqlite3",
+        FakeEmbeddings(),
+    )
+    observer_store.start(1, "session-one")
+    observer_store.start(2, "session-two")
+    observer_store.store_turn(1, "session-one", "User one prompt", "User one response")
+    observer_store.store_turn(2, "session-two", "User two prompt", "User two response")
     class ClearEvidenceLLM:
         def generate(self, prompt, max_tokens=800):
             return json.dumps({"claims": [{
@@ -2047,6 +2465,7 @@ def test_clear_history_removes_all_user_history_without_affecting_other_users(tm
     monkeypatch.setattr(server, "AgentOutputVectorAgent", lambda: vectors)
     monkeypatch.setattr(server, "PersistentWebVectorGraph", lambda: web_store)
     monkeypatch.setattr(server, "EVIDENCE_LEDGER_STORE", evidence_store)
+    monkeypatch.setattr(server, "OBSERVER_AGENT", SimpleNamespace(store=observer_store))
 
     assert server.clear_user_history(current_user=TEST_USER) == {"cleared": True}
     assert activity_store.graph(1)["total"] == 0
@@ -2066,6 +2485,140 @@ def test_clear_history_removes_all_user_history_without_affecting_other_users(tm
     assert evidence_store.list_reports(1) == []
     assert len(evidence_store.list_reports(2)) == 1
     assert web_store.store_and_retrieve(2, "User two current report", [1.0, 0.0], [], [])
+    assert observer_store.get_session(1, "session-one") is None
+    assert observer_store.get_session(2, "session-two") is not None
+    assert observer_store.retrieve(1, "session-one", "User one") == []
+    assert observer_store.retrieve(2, "session-two", "User two")
+
+
+def test_observer_session_vectors_are_private_bounded_and_stop_gated(tmp_path):
+    class FakeEmbeddings:
+        def embed_documents(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+        def embed_query(self, text):
+            return [1.0, 0.0]
+
+    store = ObserverSessionStore(tmp_path / "observer-store.sqlite3", FakeEmbeddings())
+    store.start(1, "session-a")
+    store.start(1, "session-b")
+    store.start(2, "session-a")
+    store.store_turn(1, "session-a", "Plan an accessible launch", "Use a staged rollout.")
+    store.store_turn(1, "session-b", "Unrelated session", "Separate context.")
+    store.store_turn(2, "session-a", "Other user context", "Private to user two.")
+
+    relevant = store.retrieve(1, "session-a", "launch")
+    assert [item["memory_type"] for item in relevant] == ["assistant_answer", "user_message"]
+    assert [item["content"] for item in relevant] == [
+        "Assistant answer: Use a staged rollout.",
+        "User message: Plan an accessible launch",
+    ]
+    assert all(item["similarity"] == 1.0 for item in relevant)
+    assert all("Unrelated session" not in item["content"] for item in store.retrieve(1, "session-a", "context"))
+    assert all("user two" not in item["content"].lower() for item in store.retrieve(1, "session-a", "context"))
+    assert store.stop(1, "session-a")
+    try:
+        store.store_turn(1, "session-a", "Should not persist", "Stopped session")
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("A stopped Observer session accepted a new memory.")
+
+
+def test_observer_default_vectors_work_without_embedding_model_download(tmp_path):
+    store = ObserverSessionStore(tmp_path / "observer-local-vectors.sqlite3")
+    store.start(1, "offline-session")
+    store.store_turn(
+        1,
+        "offline-session",
+        "Plan a staged deployment rollout safely",
+        "Keep rollback criteria measurable.",
+    )
+
+    memories = store.retrieve(1, "offline-session", "deployment rollout")
+
+    assert memories
+    assert any("deployment rollout" in memory["content"] for memory in memories)
+    assert len(store._get_embeddings().embed_query("local vector check")) == 768
+
+
+def test_observer_research_suppresses_private_queries_and_formats_insights(tmp_path):
+    class FakeEmbeddings:
+        def embed_documents(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+        def embed_query(self, text):
+            return [1.0, 0.0]
+
+    prompts = []
+    searches = []
+
+    class FakeLLM:
+        def generate(self, prompt, max_tokens=800):
+            prompts.append(prompt)
+            if "Return JSON with string fields `user_profile`" in prompt:
+                return json.dumps({
+                    "user_profile": "Prefers concise explanations.",
+                    "context_summary": "Working through a rollout plan.",
+                    "research_query": "My confidential rollout at Example Corp",
+                })
+            return json.dumps({
+                "insight": "The rollback criteria are still open.",
+                "next_idea": "Set a measurable rollback threshold.",
+            })
+
+    def search(query):
+        searches.append(query)
+        return []
+
+    store = ObserverSessionStore(tmp_path / "observer-agent.sqlite3", FakeEmbeddings())
+    store.start(7, "observer-session")
+    result = ObserverAgent(store, search).observe(
+        7,
+        "observer-session",
+        "What should we do next?",
+        "Prepare a staged rollout.",
+        FakeLLM(),
+    )
+
+    assert result["insight"] == "The rollback criteria are still open."
+    assert result["next_idea"] == "Set a measurable rollback threshold."
+    assert result["research_query"] == ""
+    assert result["research_sources"] == []
+    assert searches == []
+    assert len(prompts) == 2
+    assert all("{web_results}" not in prompt for prompt in prompts)
+    assert _safe_search_query("Find public sources about canary rollouts")
+    assert not _safe_search_query("My password is private")
+
+
+def test_observer_api_session_controls_require_auth_and_are_user_scoped(tmp_path, monkeypatch):
+    client = TestClient(server.app)
+    assert client.post("/api/observer/session", json={"session_id": "4ad7af04-f682-43d8-a181-1c29c2844ce1"}).status_code == 401
+    assert client.post("/api/observer/observe", json={
+        "session_id": "4ad7af04-f682-43d8-a181-1c29c2844ce1",
+        "query": "hello",
+        "answer": "hi",
+    }).status_code == 401
+
+    class FakeEmbeddings:
+        def embed_documents(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+        def embed_query(self, text):
+            return [1.0, 0.0]
+
+    store = ObserverSessionStore(tmp_path / "observer-api.sqlite3", FakeEmbeddings())
+    monkeypatch.setattr(server, "OBSERVER_AGENT", ObserverAgent(store))
+    payload = server.ObserverSessionRequest(session_id="4ad7af04-f682-43d8-a181-1c29c2844ce1")
+    assert server.start_observer_session(payload, current_user=TEST_USER) == {
+        "enabled": True,
+        "user_profile": "",
+        "context_summary": "",
+    }
+    assert store.is_enabled(TEST_USER.id, str(payload.session_id))
+    server.stop_observer_session(payload, current_user=TEST_USER)
+    assert not store.is_enabled(TEST_USER.id, str(payload.session_id))
 
 
 def test_current_and_verification_queries_bypass_answer_cache():
@@ -2120,7 +2673,16 @@ def test_query_endpoint_returns_vector_cache_hit_without_engine(monkeypatch, tmp
     }
     cache.store(TEST_USER.id, "cache-model", "Plan safe deployment rollout for service", cached_workflow)
     monkeypatch.setattr(server, "ANSWER_CACHE", cache)
-    monkeypatch.setattr(server, "build_llm_adapter", lambda: SimpleNamespace(model="cache-model"))
+    monkeypatch.setattr(
+        server,
+        "build_llm_adapter",
+        lambda: SimpleNamespace(
+            model="cache-model",
+            generate=lambda prompt, max_tokens=800: (
+                "Roll out gradually and keep rollback ready."
+            ),
+        ),
+    )
 
     def engine_must_not_start(*args, **kwargs):
         raise AssertionError("A cache hit must bypass engine construction.")
@@ -2140,11 +2702,26 @@ def test_query_endpoint_returns_vector_cache_hit_without_engine(monkeypatch, tmp
 def test_stream_vector_cache_returns_instant_hit_without_running_engine(monkeypatch, tmp_path):
     cache = VectorAnswerCache(tmp_path / "stream-hit.sqlite3")
     monkeypatch.setattr(server, "ANSWER_CACHE", cache)
-    monkeypatch.setattr(server, "build_llm_adapter", lambda: SimpleNamespace(model="cache-model"))
+    monkeypatch.setattr(
+        server,
+        "build_llm_adapter",
+        lambda: SimpleNamespace(
+            model="cache-model",
+            generate=lambda prompt, max_tokens=800: (
+                "Roll out gradually and keep rollback ready."
+            ),
+        ),
+    )
     engine_calls = 0
 
     class FakeEngine:
-        llm = SimpleNamespace(enabled=True, model="cache-model")
+        llm = SimpleNamespace(
+            enabled=True,
+            model="cache-model",
+            generate=lambda prompt, max_tokens=800: (
+                "Roll out gradually and keep rollback ready."
+            ),
+        )
 
         def __init__(self, total_agents):
             nonlocal engine_calls
@@ -2210,11 +2787,220 @@ def test_register_login_current_user_and_logout_revoke_token(tmp_path, monkeypat
     assert client.get("/api/auth/me", headers=headers).status_code == 401
 
 
+def test_google_login_keeps_same_email_accounts_separate_and_consumes_nonce(tmp_path, monkeypatch):
+    monkeypatch.setattr(auth, "AUTH_DB_PATH", tmp_path / "google-auth.sqlite3")
+    monkeypatch.setattr(server, "GOOGLE_CLIENT_ID", "test-google-client-id")
+    monkeypatch.setattr(
+        server,
+        "verify_google_credential",
+        lambda credential, nonce: ("Researcher@example.com", "google-subject-1"),
+    )
+    client = TestClient(server.app)
+
+    password_account = client.post("/api/auth/register", json={
+        "email": "researcher@example.com",
+        "password": "correct horse battery",
+    })
+    assert password_account.status_code == 201
+    expected_user_id = password_account.json()["user"]["id"]
+
+    config = client.get("/api/auth/google/config")
+    assert config.status_code == 200
+    assert config.json()["enabled"] is True
+    assert config.json()["client_id"] == "test-google-client-id"
+    nonce = config.json()["nonce"]
+
+    google_response = client.post("/api/auth/google", json={
+        "credential": "verified-google-credential",
+        "nonce": nonce,
+    })
+    assert google_response.status_code == 200
+    google_user_id = google_response.json()["user"]["id"]
+    assert google_user_id < 0
+    assert google_user_id != expected_user_id
+    token = google_response.json()["access_token"]
+    assert client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"}).status_code == 200
+
+    password_login = client.post("/api/auth/login", json={
+        "email": "researcher@example.com",
+        "password": "correct horse battery",
+    })
+    assert password_login.status_code == 200
+    assert password_login.json()["user"]["id"] == expected_user_id
+    password_headers = {
+        "Authorization": f"Bearer {password_login.json()['access_token']}",
+    }
+
+    google_headers = {"Authorization": f"Bearer {token}"}
+    google_logout = client.post("/api/auth/logout", headers=google_headers)
+    assert google_logout.status_code == 204
+    assert client.get("/api/auth/me", headers=google_headers).status_code == 401
+    assert client.get("/api/auth/me", headers=password_headers).status_code == 200
+
+    replay = client.post("/api/auth/google", json={
+        "credential": "verified-google-credential",
+        "nonce": nonce,
+    })
+    assert replay.status_code == 401
+
+    connection = auth._connect()
+    try:
+        row = connection.execute(
+            "SELECT email FROM users WHERE id = ?",
+            (expected_user_id,),
+        ).fetchone()
+        google_row = connection.execute(
+            "SELECT google_sub, email FROM google_accounts WHERE id = ?",
+            (-google_user_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row["email"] == "researcher@example.com"
+    assert google_row["google_sub"] == "google-subject-1"
+    assert google_row["email"] == "researcher@example.com"
+
+
+def test_google_auth_verifies_audience_email_and_nonce(monkeypatch):
+    monkeypatch.setattr(server, "GOOGLE_CLIENT_ID", "expected-client-id")
+    verification_calls = []
+    monkeypatch.setattr(
+        server.id_token,
+        "verify_oauth2_token",
+        lambda credential, request, audience: (
+            verification_calls.append((credential, audience))
+            or {
+                "iss": "https://accounts.google.com",
+                "email_verified": True,
+                "email": "google@example.com",
+                "sub": "google-subject",
+                "nonce": "expected-nonce",
+            }
+        ),
+    )
+
+    assert server.verify_google_credential("signed-id-token", "expected-nonce") == (
+        "google@example.com",
+        "google-subject",
+    )
+    assert verification_calls == [("signed-id-token", "expected-client-id")]
+
+    monkeypatch.setattr(
+        server.id_token,
+        "verify_oauth2_token",
+        lambda credential, request, audience: {
+            "iss": "https://accounts.google.com",
+            "email_verified": False,
+            "email": "google@example.com",
+            "sub": "google-subject",
+            "nonce": "expected-nonce",
+        },
+    )
+    try:
+        server.verify_google_credential("unverified-id-token", "expected-nonce")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("An unverified Google email was accepted.")
+
+
+def test_google_accounts_are_independent_even_when_email_matches(tmp_path, monkeypatch):
+    monkeypatch.setattr(auth, "AUTH_DB_PATH", tmp_path / "google-new-account.sqlite3")
+
+    user = auth.authenticate_google_user("NewUser@example.com", "google-subject-2")
+
+    assert user is not None
+    assert user.email == "newuser@example.com"
+    assert auth.authenticate_google_user("newuser@example.com", "google-subject-2") == user
+    other_user = auth.authenticate_google_user("newuser@example.com", "different-google-subject")
+    assert other_user is not None
+    assert other_user.email == user.email
+    assert other_user.id != user.id
+
+
+def test_google_auth_preserves_existing_users_table(tmp_path, monkeypatch):
+    database = tmp_path / "legacy-auth.sqlite3"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                token_version INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO users (email, password_hash) VALUES (?, ?)",
+            ("existing@example.com", "existing-password-hash"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    monkeypatch.setattr(auth, "AUTH_DB_PATH", database)
+    connection = auth._connect()
+    try:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(users)").fetchall()
+        }
+        account_tables = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        row = connection.execute("SELECT id, email FROM users").fetchone()
+    finally:
+        connection.close()
+
+    assert "google_sub" not in columns
+    assert "google_accounts" in account_tables
+    assert row["id"] == 1
+    assert row["email"] == "existing@example.com"
+
+
 def test_llm_adapter_can_be_created_without_crashing():
     adapter = build_llm_adapter()
     assert adapter is not None
     assert hasattr(adapter, "enabled")
     assert isinstance(adapter.enabled, bool)
+
+
+def test_answer_sanitizer_uses_request_and_returns_cleaned_text():
+    requests = []
+
+    class FakeLLM:
+        def generate(self, prompt, max_tokens=800):
+            requests.append((prompt, max_tokens))
+            return "  Keep the relevant answer only.  "
+
+    answer = AnswerSanitizerAgent(FakeLLM()).sanitize(
+        "Explain this provider warning.",
+        "Here is the answer.\nInternal debug trace: retrying model.",
+    )
+
+    assert answer == "Keep the relevant answer only."
+    assert requests[0][1] == 1600
+    assert "Explain this provider warning." in requests[0][0]
+    assert "Internal debug trace: retrying model." in requests[0][0]
+    assert "Do not remove technical errors, warnings" in requests[0][0]
+
+
+def test_answer_sanitizer_rejects_empty_generated_answers():
+    class FakeLLM:
+        def generate(self, prompt, max_tokens=800):
+            return "  "
+
+    try:
+        AnswerSanitizerAgent(FakeLLM()).sanitize("Answer this.", "Draft answer.")
+    except RuntimeError as error:
+        assert "cleaning agent returned an empty response" in str(error)
+    else:
+        raise AssertionError("The sanitizer must reject an empty cleaned response.")
 
 
 def test_llm_adapter_uses_groq_configuration(monkeypatch):
@@ -2255,24 +3041,89 @@ def test_provider_error_summary_contains_safe_diagnostics_only():
     assert "provider response body" not in summary
 
 
-def test_llm_adapter_sends_images_to_configured_vision_model():
+def test_llm_adapter_sends_images_to_default_groq_vision_model(monkeypatch):
     requests = []
+    monkeypatch.delenv("GROQ_VISION_MODEL", raising=False)
 
     class FakeCompletions:
         def create(self, **kwargs):
             requests.append(kwargs)
             return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="Image described."))])
 
-    adapter = llm_client.LLMAdapter(api_key="test-key", model="text-model")
+    adapter = llm_client.LLMAdapter(
+        api_key="test-key",
+        base_url="https://api.groq.com/openai/v1",
+        model="openai/gpt-oss-120b",
+    )
     adapter.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
-    adapter.vision_model = "vision-model"
     result = adapter.generate("Describe the image", image_data_urls=["data:image/png;base64,aW1hZ2U="])
 
     assert result == "Image described."
-    assert requests[0]["model"] == "vision-model"
+    assert adapter.vision_model == "qwen/qwen3.8-27b"
+    assert requests[0]["model"] == "qwen/qwen3.8-27b"
     content = requests[0]["messages"][0]["content"]
     assert content[0] == {"type": "text", "text": "Describe the image"}
     assert content[1]["image_url"]["url"] == "data:image/png;base64,aW1hZ2U="
+
+
+def test_llm_adapter_fails_over_to_configured_text_model(monkeypatch):
+    monkeypatch.setenv("GROQ_FALLBACK_MODELS", "fallback-one,fallback-two")
+    requests = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            requests.append(kwargs)
+            if kwargs["model"] == "primary-model":
+                raise llm_client.APIError(
+                    "primary unavailable",
+                    request=httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
+                    body=None,
+                )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(content="Recovered from fallback."),
+                )],
+            )
+
+    adapter = llm_client.LLMAdapter(
+        api_key="test-key",
+        base_url="https://api.groq.com/openai/v1",
+        model="primary-model",
+    )
+    adapter.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+    assert adapter.generate("Test model failover") == "Recovered from fallback."
+    assert [request["model"] for request in requests] == ["primary-model", "fallback-one"]
+    assert adapter.last_used_model == "fallback-one"
+
+
+def test_llm_adapter_fails_over_to_configured_streaming_model(monkeypatch):
+    monkeypatch.setenv("GROQ_FALLBACK_MODELS", "fallback-stream")
+    requests = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            requests.append(kwargs)
+            if kwargs["model"] == "primary-stream":
+                raise llm_client.APIError(
+                    "primary unavailable",
+                    request=httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
+                    body=None,
+                )
+            return [SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content="Stream recovered."))],
+            )]
+
+    adapter = llm_client.LLMAdapter(
+        api_key="test-key",
+        base_url="https://api.groq.com/openai/v1",
+        model="primary-stream",
+    )
+    adapter.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+    assert list(adapter.stream("Test streaming model failover")) == ["Stream recovered."]
+    assert [request["model"] for request in requests] == ["primary-stream", "fallback-stream"]
+    assert adapter.last_used_model == "fallback-stream"
 
 
 def test_llm_adapter_generates_json_mode_with_classifier_settings():
@@ -2373,6 +3224,42 @@ def test_llm_adapter_increases_token_budget_after_length_empty(monkeypatch):
         "Recovered with more tokens."
     )
     assert [request["max_tokens"] for request in requests] == [300, 600]
+
+
+def test_groq_gpt_oss_retries_length_empty_with_more_budget_and_lower_effort(monkeypatch):
+    requests = []
+    responses = [
+        SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="length",
+            message=SimpleNamespace(content=None, refusal=None),
+        )]),
+        SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="stop",
+            message=SimpleNamespace(content="Recovered response.", refusal=None),
+        )]),
+    ]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            requests.append(kwargs)
+            return responses.pop(0)
+
+    adapter = llm_client.LLMAdapter(
+        api_key="test-key",
+        base_url="https://api.groq.com/openai/v1",
+        model="openai/gpt-oss-120b",
+    )
+    adapter.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _seconds: None)
+
+    assert adapter.generate("Test Groq GPT-OSS length recovery", max_tokens=512) == (
+        "Recovered response."
+    )
+    assert requests[0]["max_completion_tokens"] == 512
+    assert "reasoning_effort" not in requests[0]
+    assert requests[1]["max_completion_tokens"] == 2048
+    assert requests[1]["reasoning_effort"] == "low"
+    assert all("max_tokens" not in request for request in requests)
 
 
 def test_llm_adapter_returns_provider_refusal_text():

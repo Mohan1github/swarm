@@ -3,7 +3,6 @@ import './App.css'
 import ChatSidebar from './components/ChatSidebar'
 import ChatHeader from './components/ChatHeader'
 import ChatMessages from './components/ChatMessages'
-import WorkflowProgress from './components/WorkflowProgress'
 import ChatComposer from './components/ChatComposer'
 import DocumentReviewer from './components/DocumentReviewer'
 import AuthScreen from './components/AuthScreen'
@@ -14,6 +13,9 @@ import TypingText from './components/TypingText'
 import useAuth from './auth/useAuth'
 import useAssistantConversation from './hooks/useAssistantConversation'
 import useSwarmStream from './hooks/useSwarmStream'
+import useObserver from './hooks/useObserver'
+import ObserverAssistant from './components/ObserverAssistant'
+import { stageLabels } from './constants/workflow'
 
 function ModeTransition({ transition }) {
   if (!transition) return null
@@ -51,27 +53,29 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
   const [assistantMode, setAssistantMode] = useState(false)
   const [researchMode, setResearchMode] = useState(false)
   const [documentReviewerOpen, setDocumentReviewerOpen] = useState(false)
+  const [documentReviewFiles, setDocumentReviewFiles] = useState([])
+  const [documentReviewQuery, setDocumentReviewQuery] = useState('')
   const [historyOpen, setHistoryOpen] = useState(false)
   const [voiceState, setVoiceState] = useState('idle')
   const [modeTransition, setModeTransition] = useState(null)
   const transitionTimeout = useRef(null)
   const transitionId = useRef(0)
+  const observer = useObserver({ token })
   const {
     isRunning,
-    steps,
     activeStage,
-    activeStageIndex,
     stageTotal,
-    stageRoles,
     isResearchRun,
     messages,
-    selectedAgents,
-    latency,
     error,
-    validationScore,
     runWorkflow,
     clearLocalHistory,
-  } = useSwarmStream({ token })
+  } = useSwarmStream({
+    token,
+    observerEnabled: observer.enabled,
+    observerSessionId: observer.sessionId,
+    onObserverResult: observer.observeTurn,
+  })
   const assistantConversation = useAssistantConversation({
     token,
     active: activePage === 'assistant',
@@ -80,6 +84,7 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
 
   const handleHistoryCleared = () => {
     clearLocalHistory()
+    observer.reset()
     assistantConversation.clearLocalConversation()
     setQuery('')
     setAttachmentError('')
@@ -146,6 +151,16 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
   const handleSubmit = (event) => {
     event.preventDefault()
     const task = query.trim() || (attachments.length ? 'Analyze the attached files and photos.' : '')
+    if (researchMode) {
+      const documents = attachments
+        .filter(({ file }) => /\.(pdf|docx)$/i.test(file.name))
+        .map(({ file }) => file)
+      if (documents.length) {
+        setDocumentReviewFiles(documents)
+        setDocumentReviewQuery(query.trim())
+        setDocumentReviewerOpen(true)
+      }
+    }
     runWorkflow(task, attachments, undefined, researchMode)
     if (task) {
       attachments.forEach(({ previewUrl }) => previewUrl && URL.revokeObjectURL(previewUrl))
@@ -157,6 +172,12 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
 
   const handleVoiceSubmit = (transcript) => {
     if (transcript.trim()) runWorkflow(transcript.trim(), [], undefined, researchMode)
+  }
+
+  const handleResearchModeChange = (enabled) => {
+    if (enabled && !researchMode) clearLocalHistory()
+    setResearchMode(enabled)
+    if (!enabled) setDocumentReviewerOpen(false)
   }
 
   const handleModeChange = (enabled) => {
@@ -182,6 +203,7 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
   }
 
   const handleNewTask = () => {
+    clearLocalHistory()
     attachments.forEach(({ previewUrl }) => previewUrl && URL.revokeObjectURL(previewUrl))
     setQuery('')
     setAttachments([])
@@ -199,6 +221,9 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
           isProactive={assistantConversation.isProactive}
           proactiveEnabled={assistantConversation.proactiveEnabled}
           onToggleProactive={assistantConversation.toggleProactive}
+          assistantName={assistantConversation.assistantName}
+          emotionalAssistantEnabled={assistantConversation.emotionalAssistantEnabled}
+          onSavePreferences={assistantConversation.savePreferences}
           messages={assistantConversation.messages}
           error={assistantConversation.error}
           memoryTurnCount={assistantConversation.memoryTurnCount}
@@ -249,14 +274,14 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
       <ModeTransition transition={modeTransition} />
       <ChatSidebar
         user={user}
-        selectedAgents={selectedAgents}
-        latency={latency}
-        validationScore={validationScore}
         isRunning={isRunning}
         researchMode={researchMode}
-        steps={steps}
         activeStage={activeStage}
+        activePage={activePage}
         onShowHistory={() => setHistoryOpen(true)}
+        onShowContextGraph={handleShowContextGraph}
+        onBackToChat={handleBackToChat}
+        onNewTask={handleNewTask}
       />
 
       <main className={`chat-main ${activePage === 'contextGraph' ? 'context-graph-open' : ''} ${hasUserMessages ? 'has-conversation' : 'empty-chat'}`}>
@@ -265,16 +290,12 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
           assistantMode={assistantMode}
           onAssistantModeChange={handleModeChange}
           researchMode={researchMode}
-          onResearchModeChange={(enabled) => {
-            setResearchMode(enabled)
-            if (!enabled) setDocumentReviewerOpen(false)
-          }}
-          onOpenDocumentReviewer={() => setDocumentReviewerOpen(true)}
+          observerEnabled={observer.enabled}
+          observerPending={observer.isPending}
+          onObserverToggle={observer.toggle}
+          onResearchModeChange={handleResearchModeChange}
           isRunning={isRunning}
-          onShowContextGraph={handleShowContextGraph}
-          onBackToChat={handleBackToChat}
           onLogout={onLogout}
-          onReset={handleNewTask}
         />
 
         <div className={`chat-workspace ${assistantMode ? 'assistant-mode' : ''}`} hidden={activePage === 'contextGraph'}>
@@ -286,16 +307,13 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
             )}
 
             <div className={`chat-conversation-layout ${researchMode && stageTotal ? 'workflow-running' : ''}`}>
-              <ChatMessages messages={hasUserMessages ? messages : []} error={error} />
-              {researchMode && isResearchRun && stageTotal > 0 ? (
-                <WorkflowProgress
-                  activeStage={activeStage}
-                  activeStageIndex={activeStageIndex}
-                  stageTotal={stageTotal}
-                  stageRoles={stageRoles}
-                  steps={steps}
-                />
+              {researchMode && isResearchRun && isRunning && activeStage ? (
+                <div className="research-active-step" role="status" aria-live="polite">
+                  <span className="research-active-step-dot" aria-hidden="true" />
+                  <span>{stageLabels[activeStage] ?? activeStage.replaceAll('_', ' ')}</span>
+                </div>
               ) : null}
+              <ChatMessages messages={hasUserMessages ? messages : []} error={error} />
             </div>
 
             <ChatComposer
@@ -304,6 +322,8 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
               attachments={attachments}
               attachmentError={attachmentError}
               isRunning={isRunning}
+              researchMode={researchMode}
+              onOpenDocumentReviewer={() => setDocumentReviewerOpen(true)}
               isActive={activePage === 'chat'}
               voiceState={voiceState}
               onVoiceStateChange={setVoiceState}
@@ -325,7 +345,17 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
         <DocumentReviewer
           token={token}
           initialDocuments={messages.flatMap((message) => message.supportingDocuments || [])}
+          initialFiles={documentReviewFiles}
+          initialReviewQuery={documentReviewQuery}
+          autoReviewOnOpen={documentReviewFiles.length > 0}
           onClose={() => setDocumentReviewerOpen(false)}
+        />
+      ) : null}
+      {(observer.enabled || observer.error) && activePage === 'chat' ? (
+        <ObserverAssistant
+          result={observer.result}
+          error={observer.error}
+          isObserving={observer.isObserving}
         />
       ) : null}
       <ChatHistoryDrawer
@@ -345,12 +375,28 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
 }
 
 function App() {
-  const { token, user, isLoading, login, register, logout } = useAuth()
+  const {
+    token,
+    user,
+    isLoading,
+    login,
+    register,
+    authenticateWithGoogle,
+    logout,
+  } = useAuth()
 
   if (isLoading) {
     return <main className="auth-loading" aria-label="Loading account">Checking your session...</main>
   }
-  if (!user) return <AuthScreen onLogin={login} onRegister={register} />
+  if (!user) {
+    return (
+      <AuthScreen
+        onLogin={login}
+        onRegister={register}
+        onGoogleSignIn={authenticateWithGoogle}
+      />
+    )
+  }
 
   return <AuthenticatedWorkspace token={token} user={user} onLogout={logout} />
 }

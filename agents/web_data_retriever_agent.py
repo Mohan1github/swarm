@@ -2,20 +2,24 @@ from __future__ import annotations
 
 import hashlib
 import html
+import ipaddress
 import json
 import logging
 import math
 import os
 import re
+import socket
 import sqlite3
 import uuid
 from contextlib import contextmanager
 from functools import lru_cache
 from heapq import heappop, heappush
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterator, TypedDict
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
+import httpx
 from langgraph.graph import END, START, StateGraph
 from rank_bm25 import BM25Okapi
 
@@ -25,6 +29,10 @@ MAX_DOCUMENTS_PER_USER = 5000
 MAX_RESULTS = 5
 MAX_SOURCE_CHARS = 5000
 MAX_RETRIEVED_SOURCES = 8
+MAX_SCRAPED_PAGES = 3
+MAX_PAGE_BYTES = 2_000_000
+PAGE_FETCH_TIMEOUT_SECONDS = 6.0
+MAX_REDIRECTS = 3
 TOPIC_SIMILARITY_THRESHOLD = 0.72
 GRAPH_EDGE_SIMILARITY_THRESHOLD = 0.2
 GRAPH_NEIGHBOR_COUNT = 5
@@ -54,6 +62,7 @@ class WebResearchState(TypedDict, total=False):
     search_topic: str
     fetched_sources: list[dict]
     retrieved_sources: list[dict]
+    retrieval_warning: str
 
 
 def _cosine(left: list[float], right: list[float]) -> float:
@@ -82,6 +91,99 @@ def _valid_source_url(value: str) -> bool:
         and parsed.username is None
         and parsed.password is None
     )
+
+
+class _PageTextParser(HTMLParser):
+    _SKIP_TAGS = {"script", "style", "noscript", "svg", "nav", "footer", "header", "form"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.title_parts: list[str] = []
+        self.text_parts: list[str] = []
+        self.skip_depth = 0
+        self.in_title = False
+
+    def handle_starttag(self, tag: str, _attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self._SKIP_TAGS:
+            self.skip_depth += 1
+        elif tag == "title":
+            self.in_title = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._SKIP_TAGS and self.skip_depth:
+            self.skip_depth -= 1
+        elif tag == "title":
+            self.in_title = False
+
+    def handle_data(self, data: str) -> None:
+        if self.in_title:
+            self.title_parts.append(data)
+        elif not self.skip_depth:
+            self.text_parts.append(data)
+
+
+def _is_public_source_url(value: str) -> bool:
+    if not _valid_source_url(value):
+        return False
+    try:
+        parsed = urlparse(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    if port not in (None, 80, 443) or not parsed.hostname:
+        return False
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith(".localhost") or hostname.endswith(".local"):
+        return False
+    try:
+        addresses = {
+            ipaddress.ip_address(result[4][0])
+            for result in socket.getaddrinfo(hostname, port or (443 if parsed.scheme == "https" else 80))
+        }
+    except (OSError, ValueError):
+        return False
+    return bool(addresses) and all(address.is_global for address in addresses)
+
+
+def _scrape_public_page(url: str) -> tuple[str, str]:
+    current_url = url
+    headers = {
+        "User-Agent": "SwarmResearchBot/1.0 (+public-source retrieval)",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    for redirect_count in range(MAX_REDIRECTS + 1):
+        if not _is_public_source_url(current_url):
+            raise ValueError("The page URL is not a public HTTP(S) address.")
+        with httpx.Client(
+            timeout=PAGE_FETCH_TIMEOUT_SECONDS,
+            follow_redirects=False,
+            trust_env=False,
+            headers=headers,
+        ) as client:
+            with client.stream("GET", current_url) as response:
+                if response.is_redirect:
+                    location = response.headers.get("location")
+                    if not location or redirect_count == MAX_REDIRECTS:
+                        raise ValueError("The page exceeded the redirect limit.")
+                    current_url = urljoin(current_url, location)
+                    continue
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "").lower()
+                if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+                    return "", ""
+                body = bytearray()
+                for chunk in response.iter_bytes():
+                    remaining = MAX_PAGE_BYTES - len(body)
+                    body.extend(chunk[:remaining])
+                    if len(chunk) > remaining or len(body) >= MAX_PAGE_BYTES:
+                        break
+                encoding = response.encoding or "utf-8"
+        parser = _PageTextParser()
+        parser.feed(bytes(body).decode(encoding, errors="replace"))
+        title = _clean_text(" ".join(parser.title_parts))[:300]
+        content = _clean_text(" ".join(parser.text_parts))[:MAX_SOURCE_CHARS]
+        return title, content
+    return "", ""
 
 
 def _normalize_sources(results: object) -> list[dict]:
@@ -121,6 +223,38 @@ def _normalize_sources(results: object) -> list[dict]:
         if len(sources) >= MAX_RESULTS:
             break
     return sources
+
+
+def _normalize_duckduckgo_results(results: object) -> list[dict]:
+    if not isinstance(results, list):
+        return []
+    candidates = []
+    for result in results[:MAX_SCRAPED_PAGES]:
+        if not isinstance(result, dict):
+            continue
+        url = result.get("href") or result.get("url")
+        if not isinstance(url, str):
+            continue
+        if not _is_public_source_url(url):
+            continue
+        title = result.get("title")
+        snippet = result.get("body") or result.get("content") or ""
+        scraped_title, page_text = ("", "")
+        try:
+            scraped_title, page_text = _scrape_public_page(url)
+        except (httpx.HTTPError, OSError, ValueError) as error:
+            LOGGER.info(
+                "Could not extract public page text (%s)",
+                type(error).__name__,
+            )
+        content = page_text if len(page_text) >= 40 else snippet
+        candidates.append({
+            "title": scraped_title or title,
+            "url": url,
+            "content": content,
+            "published_date": result.get("date") or result.get("published_date") or "",
+        })
+    return _normalize_sources({"results": candidates})
 
 
 class PersistentWebVectorGraph:
@@ -450,7 +584,6 @@ class PersistentWebVectorGraph:
             for doc, score in lexical_ranked
             if score > 0
         ]
-
         dense_seeds = [
             doc["id"]
             for doc in dense_ranked[:min(3, len(dense_ranked))]
@@ -477,7 +610,6 @@ class PersistentWebVectorGraph:
                     heappush(queue, (candidate_distance, neighbor_id))
         graph_ranked = sorted(distances, key=distances.get)
         dense_ids = [doc["id"] for doc in dense_ranked]
-
         reciprocal_ranks: dict[str, float] = {}
         for ranking in (lexical_ids, dense_ids, graph_ranked):
             for rank, document_id in enumerate(ranking, start=1):
@@ -506,7 +638,6 @@ class PersistentWebVectorGraph:
             connection.execute("DELETE FROM web_research_edges WHERE user_id = ?", (user_id,))
             connection.execute("DELETE FROM web_research_documents WHERE user_id = ?", (user_id,))
             connection.execute("DELETE FROM web_research_topics WHERE user_id = ?", (user_id,))
-
 
 class WebDataRetrieverAgent:
     SYSTEM_PROMPT = (
@@ -541,9 +672,7 @@ class WebDataRetrieverAgent:
     def _get_search_tool(self, search_topic: str):
         if self.search_tool is None:
             if not os.getenv("TAVILY_API_KEY"):
-                raise WebRetrieverConfigurationError(
-                    "Live web retrieval requires TAVILY_API_KEY."
-                )
+                return None
             try:
                 from langchain_tavily import TavilySearch
             except ImportError as error:
@@ -559,33 +688,100 @@ class WebDataRetrieverAgent:
             )
         return self.search_tool
 
+    @staticmethod
+    def _duckduckgo_search(query: str) -> list[dict]:
+        try:
+            from ddgs import DDGS
+        except ImportError as error:
+            raise WebRetrieverConfigurationError(
+                "Web search fallback requires the ddgs package."
+            ) from error
+        try:
+            results = DDGS().text(query, max_results=MAX_RESULTS)
+        except Exception as error:
+            LOGGER.warning(
+                "DuckDuckGo search failed (%s)",
+                type(error).__name__,
+            )
+            raise RuntimeError("DuckDuckGo search was unavailable.") from error
+        sources = _normalize_duckduckgo_results(results)
+        if not sources:
+            raise RuntimeError("DuckDuckGo returned no usable public text sources.")
+        return sources
+
     def _get_embeddings(self):
         if self.embeddings is None:
             self.embeddings = _local_embeddings()
         return self.embeddings
 
     def _search_text(self, state: WebResearchState) -> dict:
-        result = self._get_search_tool(state.get("search_topic", "general")).invoke(
-            {"query": state["query"]}
-        )
-        sources = _normalize_sources(result)
-        if not sources:
-            raise RuntimeError("The web search returned no usable text sources.")
-        return {"fetched_sources": sources}
+        try:
+            search_tool = self._get_search_tool(state.get("search_topic", "general"))
+            if search_tool is not None:
+                result = search_tool.invoke({"query": state["query"]})
+                sources = _normalize_sources(result)
+                if sources:
+                    return {"fetched_sources": sources}
+                LOGGER.warning("Tavily returned no usable sources; trying DuckDuckGo.")
+        except Exception as error:
+            LOGGER.warning(
+                "Primary web search failed; trying DuckDuckGo (%s)",
+                type(error).__name__,
+            )
+        return {"fetched_sources": self._duckduckgo_search(state["query"])}
+
+    def search_public_sources(
+        self,
+        query: str,
+        search_topic: str = "general",
+    ) -> list[dict]:
+        result = self._search_text({
+            "query": query[:2000],
+            "search_topic": search_topic if search_topic in {"news", "finance"} else "general",
+        })
+        return [
+            {
+                **source,
+                "related_query": query[:2000],
+                "fetched_at": "",
+                "similarity": None,
+                "graph_distance": None,
+            }
+            for source in result["fetched_sources"]
+        ]
 
     def _index_and_retrieve(self, state: WebResearchState) -> dict:
-        embeddings = self._get_embeddings()
         sources = state["fetched_sources"]
-        query_vector = embeddings.embed_query(state["query"])
-        source_texts = [f"{source['title']}\n{source['content']}" for source in sources]
-        source_vectors = embeddings.embed_documents(source_texts)
-        matches = self.store.store_and_retrieve(
-            user_id=state["user_id"],
-            query=state["query"],
-            query_vector=query_vector,
-            sources=sources,
-            source_vectors=source_vectors,
-        )
+        try:
+            embeddings = self._get_embeddings()
+            query_vector = embeddings.embed_query(state["query"])
+            source_texts = [f"{source['title']}\n{source['content']}" for source in sources]
+            source_vectors = embeddings.embed_documents(source_texts)
+            matches = self.store.store_and_retrieve(
+                user_id=state["user_id"],
+                query=state["query"],
+                query_vector=query_vector,
+                sources=sources,
+                source_vectors=source_vectors,
+            )
+        except Exception as error:
+            LOGGER.exception("Dense retrieval/indexing failed; returning live search sources")
+            warning = (
+                "Local semantic indexing or persistence was unavailable "
+                f"({type(error).__name__}); showing current search sources without local indexing."
+            )
+            matches = [
+                {
+                    **source,
+                    "related_query": state["query"],
+                    "fetched_at": "",
+                    "similarity": None,
+                    "graph_distance": None,
+                    "retrieval_warning": warning,
+                }
+                for source in sources
+            ]
+            return {"retrieved_sources": matches, "retrieval_warning": warning}
         return {"retrieved_sources": matches}
 
     def retrieve(
@@ -610,8 +806,16 @@ class WebDataRetrieverAgent:
 def format_research_context(sources: list[dict]) -> str:
     if not sources:
         return "No usable public web text sources were retrieved."
-    return "\n\n".join(
+    warning = next(
         (
+            source.get("retrieval_warning")
+            for source in sources
+            if isinstance(source.get("retrieval_warning"), str)
+        ),
+        "",
+    )
+    context = "\n\n".join(
+        ( 
             f"[SOURCE {index}] {source['title']}\n"
             f"URL: {source['url']}\n"
             f"Published: {source['published_date'] or 'not provided'} | "
@@ -621,3 +825,5 @@ def format_research_context(sources: list[dict]) -> str:
         )
         for index, source in enumerate(sources, start=1)
     )
+    return f"RETRIEVAL NOTE: {warning}\n\n{context}" if warning else context
+

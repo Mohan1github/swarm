@@ -1,4 +1,78 @@
+import { useState } from 'react'
 import sanitizeStreamText from '../utils/sanitizeStreamText'
+
+const CODE_KEYWORDS = new Set([
+  'abstract', 'async', 'await', 'break', 'case', 'catch', 'class', 'const', 'continue',
+  'def', 'default', 'delete', 'do', 'else', 'enum', 'export', 'extends', 'false', 'final',
+  'finally', 'for', 'from', 'function', 'if', 'implements', 'import', 'in', 'interface',
+  'let', 'new', 'null', 'package', 'private', 'protected', 'public', 'return', 'static',
+  'super', 'switch', 'this', 'throw', 'true', 'try', 'typeof', 'undefined', 'using', 'var',
+  'while', 'yield', 'None', 'True', 'False', 'and', 'as', 'assert', 'elif', 'except', 'is',
+  'lambda', 'nonlocal', 'not', 'or', 'pass', 'raise', 'with',
+])
+
+const LANGUAGE_NAMES = {
+  bash: 'Terminal', sh: 'Shell', css: 'CSS', html: 'HTML', java: 'Java',
+  javascript: 'JavaScript', js: 'JavaScript', json: 'JSON', jsx: 'React',
+  python: 'Python', py: 'Python', sql: 'SQL', ts: 'TypeScript', tsx: 'React TSX',
+  yaml: 'YAML', yml: 'YAML',
+}
+
+function highlightCodeLine(line) {
+  const tokenPattern = /(\/\/.*$|#(?!\[).*?$|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b(?:0x[\da-f]+|\d+(?:\.\d+)?)\b|\b[A-Za-z_$][\w$]*(?=\s*\()|\b[A-Za-z_$][\w$]*\b)/gi
+  const tokens = []
+  let lastIndex = 0
+
+  for (const match of line.matchAll(tokenPattern)) {
+    if (match.index > lastIndex) tokens.push(['plain', line.slice(lastIndex, match.index)])
+    const token = match[0]
+    let type = 'plain'
+    if (/^(\/\/|#)/.test(token)) type = 'comment'
+    else if (/^["'`]/.test(token)) type = 'string'
+    else if (/^\d/.test(token)) type = 'number'
+    else if (CODE_KEYWORDS.has(token)) type = 'keyword'
+    else if (line.slice(match.index + token.length).trimStart().startsWith('(')) type = 'function'
+    else if (/^[A-Z][\w$]*$/.test(token)) type = 'type'
+    tokens.push([type, token])
+    lastIndex = match.index + token.length
+  }
+  if (lastIndex < line.length) tokens.push(['plain', line.slice(lastIndex)])
+  return tokens.map(([type, text], index) => (
+    type === 'plain' ? text : <span className={`code-token-${type}`} key={`${type}-${index}`}>{text}</span>
+  ))
+}
+
+function CodeBlock({ code, language = '' }) {
+  const normalizedLanguage = language.trim().toLowerCase()
+  const displayLanguage = LANGUAGE_NAMES[normalizedLanguage] || normalizedLanguage || 'Code'
+  const [copied, setCopied] = useState(false)
+
+  const copyCode = async () => {
+    await navigator.clipboard.writeText(code)
+    setCopied(true)
+    window.setTimeout(() => setCopied(false), 1200)
+  }
+
+  return (
+    <section className="chat-code-editor" aria-label={`${displayLanguage} code`}>
+      <header className="chat-code-editor-header">
+        <div className="chat-code-editor-dots" aria-hidden="true"><i /><i /><i /></div>
+        <span>{displayLanguage}</span>
+        <button type="button" onClick={copyCode}>{copied ? 'Copied' : 'Copy code'}</button>
+      </header>
+      <div className="chat-code-editor-body">
+        <div className="chat-code-line-numbers" aria-hidden="true">
+          {code.split('\n').map((_, index) => <span key={index}>{index + 1}</span>)}
+        </div>
+        <pre><code>{code.split('\n').map((line, index) => (
+          <span className="chat-code-line" key={`${index}-${line}`}>
+            {highlightCodeLine(line)}{'\n'}
+          </span>
+        ))}</code></pre>
+      </div>
+    </section>
+  )
+}
 
 function parseStructuredOutput(content) {
   if (typeof content !== 'string') return null
@@ -18,6 +92,7 @@ function renderTextBlocks(content) {
   const blocks = []
   let paragraph = []
   let list = []
+  let code = null
 
   const flushParagraph = () => {
     if (paragraph.length) {
@@ -33,6 +108,22 @@ function renderTextBlocks(content) {
   }
 
   for (const line of lines) {
+    const fence = line.trim().match(/^```([\w+-]*)\s*$/)
+    if (fence) {
+      if (!code) {
+        flushParagraph()
+        flushList()
+        code = { type: 'code', language: fence[1], lines: [] }
+      } else {
+        blocks.push({ ...code, code: code.lines.join('\n') })
+        code = null
+      }
+      continue
+    }
+    if (code) {
+      code.lines.push(line)
+      continue
+    }
     const text = line.trim()
     if (!text) {
       flushParagraph()
@@ -53,7 +144,47 @@ function renderTextBlocks(content) {
   }
   flushParagraph()
   flushList()
+  if (code) blocks.push({ ...code, code: code.lines.join('\n') })
   return blocks
+}
+
+function splitSentences(text) {
+  return text.match(/[^.!?]+(?:[.!?]+(?=\s|$|["')\]])|$)/g) || [text]
+}
+
+function importanceScore(sentence) {
+  const text = sentence.trim()
+  if (!text || /^(?:hi|hello|sure|certainly|of course|great|absolutely)[!,. ]*$/i.test(text)) return 0
+
+  let score = 0
+  if (/\b(key point|important|critical|main takeaway|in summary|in conclusion|bottom line|remember that|note that)\b/i.test(text)) score += 4
+  if (/\b(should|must|need to|recommend|best approach|avoid|ensure|make sure|required|only|never)\b/i.test(text)) score += 3
+  if (/\b(therefore|because|as a result|which means|leads to|results in|depends on|risk|benefit|trade-?off)\b/i.test(text)) score += 2
+  if (/\b\d+(?:[.,]\d+)?%?\b/.test(text)) score += 1
+  return score
+}
+
+function renderCoreHighlight(text, enabled, limit = 2) {
+  if (!enabled || !text) return text
+
+  const sentences = splitSentences(text)
+  const candidates = sentences
+    .map((sentence, index) => ({ index, score: importanceScore(sentence) }))
+    .filter(({ score }) => score > 0)
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+  const selected = new Set(candidates.slice(0, limit).map(({ index }) => index))
+
+  if (!selected.size) {
+    const firstSubstantive = sentences.findIndex((sentence) => importanceScore(sentence) >= 0
+      && !/^(?:hi|hello|sure|certainly|of course|great|absolutely)[!,. ]*$/i.test(sentence.trim()))
+    if (firstSubstantive >= 0) selected.add(firstSubstantive)
+  }
+
+  return sentences.map((sentence, index) => (
+    selected.has(index)
+      ? <mark className="agent-output-highlight" key={`core-${index}`}>{sentence}</mark>
+      : <span key={`text-${index}`}>{sentence}</span>
+  ))
 }
 
 function SourceCards({ sources }) {
@@ -149,7 +280,7 @@ function PlannerOutput({ parsed }) {
   )
 }
 
-export default function AgentOutput({ content, role, uiData }) {
+export default function AgentOutput({ content, role, uiData, highlightCore = false }) {
   const parsed = parseStructuredOutput(content)
   if (role === 'web_retriever' && uiData?.sources?.length) {
     return <SourceCards sources={uiData.sources} />
@@ -172,12 +303,22 @@ export default function AgentOutput({ content, role, uiData }) {
 
   return (
     <div className={`agent-output-content ${role ? `agent-output-${role}` : ''}`}>
-      {blocks.map((block, index) => block.type === 'list' ? (
-        <ul key={`list-${index}`}>
-          {block.items.map((item, itemIndex) => <li key={`${itemIndex}-${item}`}>{item}</li>)}
-        </ul>
-      ) : (
-        <p key={`paragraph-${index}`}>{block.text}</p>
+      {blocks.map((block, index) => (
+        block.type === 'code' ? (
+          <CodeBlock code={block.code} language={block.language} key={`code-${index}`} />
+        ) : block.type === 'list' ? (
+          <ul key={`list-${index}`}>
+            {block.items.map((item, itemIndex) => (
+              <li key={`${itemIndex}-${item}`}>
+                {renderCoreHighlight(item, highlightCore, 1)}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p key={`paragraph-${index}`}>
+            {renderCoreHighlight(block.text, highlightCore)}
+          </p>
+        )
       ))}
     </div>
   )

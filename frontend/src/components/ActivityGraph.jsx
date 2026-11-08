@@ -80,8 +80,10 @@ export default function ActivityGraph({ token, isRunning }) {
           const latestConversation = graph.nodes
             .filter((node) => node.kind === 'query')
             .at(-1)
-          if (isRunning && latestConversation) {
-            setSelectedConversationId(latestConversation.id)
+          if (latestConversation) {
+            setSelectedConversationId((current) => (
+              isRunning || !current ? latestConversation.id : current
+            ))
           }
           setGraphState({ graph, loading: false, error: '' })
         })

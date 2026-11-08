@@ -4,5 +4,6 @@
 swarm_auth.sqlite3*
 vector_cache.sqlite3*
 query_activity.sqlite3*
+observer_vectors.sqlite3*
 __pycache__/
 .pytest_cache/

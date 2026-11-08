@@ -8,9 +8,10 @@ class ProactiveConversationAgent:
         self.llm = llm
 
     @staticmethod
-    def _opening_prompt(memory_context: str, activity_context: str) -> str:
+    def _opening_prompt(memory_context: str, activity_context: str, assistant_name: str = "Swarm Assistant") -> str:
         return (
             "You are a warm, attentive AI workspace assistant starting or resuming a conversation. "
+            f"Your personal assistant name is {assistant_name[:40]!r}; do not introduce yourself unless natural. "
             "Review the user's private conversation and workspace context to identify a clearly "
             "relevant unfinished task or recent topic. If one stands out, naturally offer a useful "
             "next step in one concise sentence. Otherwise offer a simple, open invitation. Avoid "
@@ -23,8 +24,8 @@ class ProactiveConversationAgent:
             "Opening message:"
         )
 
-    def stream_opening(self, memory_context: str, activity_context: str = "") -> Iterator[str]:
-        prompt = self._opening_prompt(memory_context, activity_context)
+    def stream_opening(self, memory_context: str, activity_context: str = "", assistant_name: str = "Swarm Assistant") -> Iterator[str]:
+        prompt = self._opening_prompt(memory_context, activity_context, assistant_name)
         yield from self._stream(prompt, max_tokens=140)
 
     def stream_follow_up(self, memory_context: str, activity_context: str = "") -> Iterator[str]:
@@ -56,8 +57,8 @@ class ProactiveConversationAgent:
             raise RuntimeError("The LLM provider returned an empty proactive message.")
         yield response.strip()
 
-    def opening(self, memory_context: str, activity_context: str = "") -> str:
-        response = "".join(self.stream_opening(memory_context, activity_context)).strip()
+    def opening(self, memory_context: str, activity_context: str = "", assistant_name: str = "Swarm Assistant") -> str:
+        response = "".join(self.stream_opening(memory_context, activity_context, assistant_name)).strip()
         if not response:
             raise RuntimeError("The LLM provider returned an empty opening message.")
         return response

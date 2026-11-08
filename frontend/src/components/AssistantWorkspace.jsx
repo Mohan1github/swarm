@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import AssistantPresence from './AssistantPresence'
 import ChatComposer from './ChatComposer'
 import ChatMessages from './ChatMessages'
@@ -28,12 +28,68 @@ export default function AssistantWorkspace({
   onAddFiles,
   onRemoveFile,
   onVoiceSubmit,
+  assistantName,
+  emotionalAssistantEnabled,
+  onSavePreferences,
 }) {
   const [speechProgress, setSpeechProgress] = useState(0)
+  const [nameDraft, setNameDraft] = useState(assistantName)
+  const [emotionalDraft, setEmotionalDraft] = useState(emotionalAssistantEnabled)
+  const [preferencesOpen, setPreferencesOpen] = useState(false)
+  const [preferenceError, setPreferenceError] = useState('')
+  const [actionsOpen, setActionsOpen] = useState(false)
+  const [proactiveDraft, setProactiveDraft] = useState(proactiveEnabled)
+  const [isSavingPreferences, setIsSavingPreferences] = useState(false)
+  const [preferencesSaved, setPreferencesSaved] = useState(false)
+  const actionsMenuRef = useRef(null)
   const isSpeaking = speechProgress > 0 && speechProgress < 1
   const handleAssistantProgress = useCallback((progress) => {
     setSpeechProgress(progress >= 1 ? 0 : progress)
   }, [])
+
+  useEffect(() => {
+    setNameDraft(assistantName)
+    setEmotionalDraft(emotionalAssistantEnabled)
+    setProactiveDraft(proactiveEnabled)
+  }, [assistantName, emotionalAssistantEnabled, proactiveEnabled])
+
+  useEffect(() => {
+    if (!actionsOpen) return undefined
+    const closeMenu = (event) => {
+      if (!actionsMenuRef.current?.contains(event.target)) setActionsOpen(false)
+    }
+    const closeOnEscape = (event) => {
+      if (event.key === 'Escape') setActionsOpen(false)
+    }
+    document.addEventListener('pointerdown', closeMenu)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeMenu)
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [actionsOpen])
+
+  const runMenuAction = (action) => {
+    setActionsOpen(false)
+    action?.()
+  }
+
+  const savePreferences = async (event) => {
+    event.preventDefault()
+    setPreferenceError('')
+    setPreferencesSaved(false)
+    setIsSavingPreferences(true)
+    try {
+      await onSavePreferences(nameDraft, emotionalDraft, proactiveDraft)
+      setPreferencesSaved(true)
+    } catch (saveError) {
+      setPreferenceError(saveError.message || 'Could not save assistant preferences.')
+    } finally {
+      setIsSavingPreferences(false)
+    }
+
+  }
+
 
   return (
     <main className="assistant-page">
@@ -41,7 +97,7 @@ export default function AssistantWorkspace({
         <div className="assistant-page-brand">
           <span className="assistant-brand-mark" aria-hidden="true">S</span>
           <div>
-            <strong>Swarm Assistant</strong>
+            <strong>{assistantName}</strong>
             <span>Workspace companion</span>
           </div>
         </div>
@@ -62,22 +118,78 @@ export default function AssistantWorkspace({
         </div>
 
         <nav className="assistant-page-actions" aria-label="Assistant workspace navigation">
-          <button
-            type="button"
-            className="assistant-nav-button"
-            onClick={onToggleProactive}
-            aria-pressed={proactiveEnabled}
-            title={proactiveEnabled ? 'Pause automatic follow-ups' : 'Resume automatic follow-ups'}
-          >
-            {proactiveEnabled ? 'Pause proactive' : 'Resume proactive'}
-          </button>
-          <button type="button" className="assistant-nav-button" onClick={onShowHistory}>History</button>
-          <button type="button" className="assistant-nav-button" onClick={onShowContextGraph}>Context graph</button>
-          <button type="button" className="assistant-nav-button" onClick={onClearMemory}>Forget memory</button>
-          <button type="button" className="assistant-nav-button primary" onClick={onBackToChat}>Back to chat</button>
-          <button type="button" className="assistant-signout" onClick={onLogout} aria-label={`Sign out ${user.email}`} title={user.email}>Sign out</button>
+          <div className="assistant-actions-menu" ref={actionsMenuRef}>
+            <button
+              type="button"
+              className="assistant-more-button"
+              onClick={() => setActionsOpen((open) => !open)}
+              aria-label="More assistant actions"
+              aria-haspopup="menu"
+              aria-expanded={actionsOpen}
+              title="More assistant actions"
+            >
+              <i aria-hidden="true" /><i aria-hidden="true" /><i aria-hidden="true" />
+            </button>
+            {actionsOpen ? (
+              <div className="assistant-actions-dropdown" role="menu">
+                <button type="button" role="menuitem" onClick={() => runMenuAction(() => setPreferencesOpen(true))}>Assistant settings</button>
+                <button type="button" role="menuitem" onClick={() => runMenuAction(onToggleProactive)} aria-pressed={proactiveEnabled}>
+                  Proactive: {proactiveEnabled ? 'On · Turn off' : 'Off · Turn on'}
+                </button>
+                <button type="button" role="menuitem" onClick={() => runMenuAction(onShowHistory)}>History</button>
+                <button type="button" role="menuitem" onClick={() => runMenuAction(onShowContextGraph)}>Context graph</button>
+                <button type="button" role="menuitem" onClick={() => runMenuAction(onClearMemory)}>Forget memory</button>
+                <button type="button" role="menuitem" onClick={() => runMenuAction(onBackToChat)}>Back to chat</button>
+                <button type="button" role="menuitem" onClick={() => runMenuAction(onLogout)} title={user.email}>Sign out</button>
+              </div>
+            ) : null}
+          </div>
         </nav>
       </header>
+
+      {preferencesOpen ? (
+        <form className="assistant-preferences-panel" onSubmit={savePreferences}>
+          <label>
+            Personal assistant name
+            <input
+              value={nameDraft}
+              onChange={(event) => setNameDraft(event.target.value)}
+              placeholder="What should I call myself?"
+            />
+          </label>
+          <label className="assistant-preferences-toggle">
+            <input
+              type="checkbox"
+              checked={proactiveDraft}
+              onChange={(event) => setProactiveDraft(event.target.checked)}
+            />
+            <span>
+              <strong>Proactive follow-ups</strong>
+              <small>{proactiveDraft ? 'On' : 'Off'}</small>
+            </span>
+          </label>
+          <label className="assistant-preferences-toggle">
+            <input
+              type="checkbox"
+              checked={emotionalDraft}
+              onChange={(event) => setEmotionalDraft(event.target.checked)}
+            />
+            <span>
+              <strong>Allow emotional support check</strong>
+              <small>Only after strong emotional cues, ask for one camera frame with your permission.</small>
+            </span>
+          </label>
+          {preferenceError ? <p role="alert">{preferenceError}</p> : null}
+          {preferencesSaved ? <p className="assistant-preferences-success" role="status">Settings saved.</p> : null}
+          <div>
+            <button type="submit" className="assistant-nav-button primary" disabled={isSavingPreferences}>
+              {isSavingPreferences ? 'Saving…' : 'Save'}
+            </button>
+            <button type="button" className="assistant-nav-button" onClick={() => setPreferencesOpen(false)}>Cancel</button>
+          </div>
+        </form>
+      ) : null}
+
 
       <div className="assistant-page-body">
         <section className="assistant-presence-stage" aria-label="Live assistant">
@@ -105,10 +217,12 @@ export default function AssistantWorkspace({
               <span>PRIVATE WORKSPACE</span>
               <h1>Your conversation</h1>
             </div>
-            <span className="assistant-context-indicator">
-              <i aria-hidden="true" />
-              Context-aware
-            </span>
+            <div className="assistant-conversation-header-actions">
+              <span className="assistant-context-indicator">
+                <i aria-hidden="true" />
+                Context-aware
+              </span>
+            </div>
           </header>
           <div className="assistant-messages">
             <ChatMessages
