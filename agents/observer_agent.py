@@ -32,6 +32,7 @@ class _LocalFeatureEmbeddings:
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "observer_vectors.sqlite3"
 MAX_MEMORIES_PER_SESSION = 240
 MAX_RELEVANT_MEMORIES = 6
+MAX_CONTEXT_CARDS_PER_SESSION = 40
 PRIVATE_CONTEXT_PATTERN = re.compile(
     r"\b(?:my|our|private|personal|confidential|password|secret|"
     r"api[\s_-]?key|access[\s_-]?token|ssn|social[\s_-]?security)\b"
@@ -102,6 +103,36 @@ class ObserverSessionStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS observer_memories_session_idx "
                 "ON observer_memories (user_id, session_id, id DESC)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS observer_context_cards (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    session_id TEXT NOT NULL,
+                    topic TEXT NOT NULL,
+                    topic_key TEXT NOT NULL,
+                    goal TEXT NOT NULL DEFAULT '',
+                    decisions_json TEXT NOT NULL DEFAULT '[]',
+                    open_questions_json TEXT NOT NULL DEFAULT '[]',
+                    next_step TEXT NOT NULL DEFAULT '',
+                    confidence REAL NOT NULL DEFAULT 0.5,
+                    vector_json TEXT NOT NULL,
+                    source_excerpt TEXT NOT NULL DEFAULT '',
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TEXT NOT NULL DEFAULT (datetime('now', '+30 days')),
+                    FOREIGN KEY (user_id, session_id)
+                        REFERENCES observer_sessions (user_id, session_id)
+                        ON DELETE CASCADE,
+                    UNIQUE (user_id, session_id, topic_key)
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS observer_context_cards_session_idx "
+                "ON observer_context_cards (user_id, session_id, pinned DESC, updated_at DESC)"
             )
 
     def _get_embeddings(self):
@@ -238,6 +269,291 @@ class ObserverSessionStore:
                     MAX_MEMORIES_PER_SESSION,
                 ),
             )
+
+    @staticmethod
+    def _normalize_context_card(card: dict) -> dict:
+        def clean_text(value: object, limit: int) -> str:
+            return " ".join(value.split())[:limit] if isinstance(value, str) else ""
+
+        def clean_list(value: object, limit: int = 5) -> list[str]:
+            if not isinstance(value, list):
+                return []
+            return [
+                clean_text(item, 300)
+                for item in value
+                if isinstance(item, str) and clean_text(item, 300)
+            ][:limit]
+
+        topic = clean_text(card.get("topic"), 180)
+        if not topic:
+            return {}
+        confidence = card.get("confidence", 0.5)
+        try:
+            confidence = max(0.0, min(1.0, float(confidence)))
+        except (TypeError, ValueError):
+            confidence = 0.5
+        topic_key = re.sub(r"[^a-z0-9]+", " ", topic.lower()).strip()[:180]
+        return {
+            "topic": topic,
+            "topic_key": topic_key or str(uuid.uuid4()),
+            "goal": clean_text(card.get("goal"), 600),
+            "decisions": clean_list(card.get("decisions")),
+            "open_questions": clean_list(card.get("open_questions")),
+            "next_step": clean_text(card.get("next_step"), 500),
+            "confidence": confidence,
+        }
+
+    def store_context_card(
+        self,
+        user_id: int,
+        session_id: str,
+        card: dict,
+        source_excerpt: str,
+    ) -> dict | None:
+        normalized = self._normalize_context_card(card)
+        if not normalized:
+            return None
+
+        vector_text = "\n".join((
+            normalized["topic"],
+            normalized["goal"],
+            *normalized["decisions"],
+            *normalized["open_questions"],
+            normalized["next_step"],
+        ))
+        vector = self._get_embeddings().embed_query(vector_text[:3000])
+        if not vector:
+            raise RuntimeError("The Observer context-card embedding was empty.")
+        values = (
+            user_id,
+            session_id,
+            normalized["topic"],
+            normalized["topic_key"],
+            normalized["goal"],
+            json.dumps(normalized["decisions"], ensure_ascii=True),
+            json.dumps(normalized["open_questions"], ensure_ascii=True),
+            normalized["next_step"],
+            normalized["confidence"],
+            json.dumps(vector, separators=(",", ":")),
+            " ".join(source_excerpt.split())[:500],
+        )
+        with self._connection() as connection:
+            session = connection.execute(
+                """
+                SELECT enabled FROM observer_sessions
+                WHERE user_id = ? AND session_id = ?
+                """,
+                (user_id, session_id),
+            ).fetchone()
+            if not session or not session["enabled"]:
+                raise PermissionError("Observer mode is not active for this session.")
+            connection.execute(
+                """
+                INSERT INTO observer_context_cards (
+                    user_id, session_id, topic, topic_key, goal, decisions_json,
+                    open_questions_json, next_step, confidence, vector_json, source_excerpt
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (user_id, session_id, topic_key) DO UPDATE SET
+                    topic = excluded.topic,
+                    goal = excluded.goal,
+                    decisions_json = excluded.decisions_json,
+                    open_questions_json = excluded.open_questions_json,
+                    next_step = excluded.next_step,
+                    confidence = excluded.confidence,
+                    vector_json = excluded.vector_json,
+                    source_excerpt = excluded.source_excerpt,
+                    updated_at = CURRENT_TIMESTAMP,
+                    expires_at = datetime('now', '+30 days')
+                """,
+                values,
+            )
+            connection.execute(
+                """
+                DELETE FROM observer_context_cards
+                WHERE user_id = ? AND session_id = ? AND pinned = 0
+                  AND id NOT IN (
+                    SELECT id FROM observer_context_cards
+                    WHERE user_id = ? AND session_id = ?
+                    ORDER BY updated_at DESC LIMIT ?
+                  )
+                """,
+                (
+                    user_id,
+                    session_id,
+                    user_id,
+                    session_id,
+                    MAX_CONTEXT_CARDS_PER_SESSION,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM observer_context_cards
+                WHERE user_id = ? AND session_id = ? AND topic_key = ?
+                """,
+                (user_id, session_id, normalized["topic_key"]),
+            ).fetchone()
+        return self._context_card_row(row)
+
+    @staticmethod
+    def _context_card_row(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "topic": row["topic"],
+            "goal": row["goal"],
+            "decisions": json.loads(row["decisions_json"]),
+            "open_questions": json.loads(row["open_questions_json"]),
+            "next_step": row["next_step"],
+            "confidence": row["confidence"],
+            "source_excerpt": row["source_excerpt"],
+            "pinned": bool(row["pinned"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "expires_at": row["expires_at"],
+        }
+
+    def list_context_cards(self, user_id: int, session_id: str) -> list[dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM observer_context_cards
+                WHERE user_id = ? AND session_id = ?
+                  AND (pinned = 1 OR expires_at > CURRENT_TIMESTAMP)
+                ORDER BY pinned DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (user_id, session_id, MAX_CONTEXT_CARDS_PER_SESSION),
+            ).fetchall()
+        return [self._context_card_row(row) for row in rows]
+
+    def retrieve_context_cards(
+        self,
+        user_id: int,
+        session_id: str,
+        query: str,
+        limit: int = 4,
+    ) -> list[dict]:
+        query_vector = self._get_embeddings().embed_query(query[:3000])
+        if not query_vector:
+            return []
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM observer_context_cards
+                WHERE user_id = ? AND session_id = ?
+                  AND (pinned = 1 OR expires_at > CURRENT_TIMESTAMP)
+                """,
+                (user_id, session_id),
+            ).fetchall()
+        matches = []
+        for row in rows:
+            similarity = _cosine(query_vector, json.loads(row["vector_json"]))
+            if similarity < 0.12:
+                continue
+            card = self._context_card_row(row)
+            card["similarity"] = round(similarity, 4)
+            matches.append(card)
+        matches.sort(
+            key=lambda card: (
+                bool(card["pinned"]),
+                float(card["similarity"]),
+                card["updated_at"],
+            ),
+            reverse=True,
+        )
+        return matches[:max(1, min(limit, 8))]
+
+    def update_context_card(
+        self,
+        user_id: int,
+        session_id: str,
+        card_id: int,
+        changes: dict,
+    ) -> dict:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM observer_context_cards
+                WHERE id = ? AND user_id = ? AND session_id = ?
+                """,
+                (card_id, user_id, session_id),
+            ).fetchone()
+            if not row:
+                raise KeyError("Observer context card was not found.")
+            current = self._context_card_row(row)
+            if "pinned" in changes:
+                if not isinstance(changes["pinned"], bool):
+                    raise ValueError("Pinned must be a boolean.")
+                current["pinned"] = changes["pinned"]
+            card_fields = {"topic", "goal", "decisions", "open_questions", "next_step"}
+            if card_fields.intersection(changes):
+                current.update({key: value for key, value in changes.items() if key in card_fields})
+                normalized = self._normalize_context_card(current)
+                if not normalized:
+                    raise ValueError("Topic cannot be empty.")
+                vector_text = "\n".join((
+                    normalized["topic"],
+                    normalized["goal"],
+                    *normalized["decisions"],
+                    *normalized["open_questions"],
+                    normalized["next_step"],
+                ))
+                vector = self._get_embeddings().embed_query(vector_text[:3000])
+                if not vector:
+                    raise RuntimeError("The Observer context-card embedding was empty.")
+                duplicate = connection.execute(
+                    """
+                    SELECT id FROM observer_context_cards
+                    WHERE user_id = ? AND session_id = ? AND topic_key = ? AND id != ?
+                    """,
+                    (user_id, session_id, normalized["topic_key"], card_id),
+                ).fetchone()
+                if duplicate:
+                    raise ValueError("A context card for this topic already exists.")
+                current.update(normalized)
+                connection.execute(
+                    """
+                    UPDATE observer_context_cards SET
+                        topic = ?, topic_key = ?, goal = ?, decisions_json = ?,
+                        open_questions_json = ?, next_step = ?, confidence = ?,
+                        vector_json = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ? AND session_id = ?
+                    """,
+                    (
+                        normalized["topic"], normalized["topic_key"], normalized["goal"],
+                        json.dumps(normalized["decisions"], ensure_ascii=True),
+                        json.dumps(normalized["open_questions"], ensure_ascii=True),
+                        normalized["next_step"], normalized["confidence"],
+                        json.dumps(vector, separators=(",", ":")),
+                        card_id, user_id, session_id,
+                    ),
+                )
+            if "pinned" in changes:
+                connection.execute(
+                    """
+                    UPDATE observer_context_cards SET pinned = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ? AND session_id = ?
+                    """,
+                    (int(changes["pinned"]), card_id, user_id, session_id),
+                )
+            updated = connection.execute(
+                """
+                SELECT * FROM observer_context_cards
+                WHERE id = ? AND user_id = ? AND session_id = ?
+                """,
+                (card_id, user_id, session_id),
+            ).fetchone()
+        return self._context_card_row(updated)
+
+    def delete_context_card(self, user_id: int, session_id: str, card_id: int) -> bool:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM observer_context_cards
+                WHERE id = ? AND user_id = ? AND session_id = ?
+                """,
+                (card_id, user_id, session_id),
+            )
+        return cursor.rowcount > 0
 
     def retrieve(
         self,
@@ -411,10 +727,24 @@ class ObserverAgent:
             session_id,
             f"{query}\n{answer}",
         )
+        relevant_context_cards = self.store.retrieve_context_cards(
+            user_id,
+            session_id,
+            query,
+        )
         memory_text = "\n\n".join(
             f"[{memory['memory_type']} · relevance {memory['similarity']}]\n{memory['content']}"
             for memory in memories
         ) or "(No earlier relevant session memories.)"
+        card_context = "\n\n".join(
+            f"[Context thread · relevance {card['similarity']} · "
+            f"{'pinned' if card['pinned'] else 'recent'}]\n"
+            f"Topic: {card['topic']}\nGoal: {card['goal']}\n"
+            f"Decisions: {'; '.join(card['decisions'])}\n"
+            f"Open questions: {'; '.join(card['open_questions'])}\n"
+            f"Possible next step: {card['next_step']}"
+            for card in relevant_context_cards
+        ) or "(No earlier context threads.)"
         extraction_prompt = (
             "You are the Observer for one explicitly enabled chat session. Update only this session's "
             "short-term user preference profile and active-context summary from the supplied user "
@@ -423,10 +753,15 @@ class ObserverAgent:
             "the current task context. Do not infer identity, health, politics, or other sensitive "
             "traits. Create a generic public-web research query only if public research would help; "
             "never include names, account data, contact details, secrets, or private facts in it. "
+            "Also return `context_card` as an object with `topic` (short neutral label), `goal`, "
+            "`decisions` (array of explicit decisions only), `open_questions` (array), `next_step`, "
+            "and numeric `confidence` from 0 to 1. Extract only details grounded in these turns; "
+            "use empty strings/arrays when unknown. Do not infer sensitive traits. "
             "Return JSON with string fields `user_profile`, `context_summary`, and `research_query`.\n\n"
             f"PREVIOUS SESSION PROFILE:\n{session['user_profile']}\n\n"
             f"PREVIOUS SESSION CONTEXT:\n{session['context_summary']}\n\n"
             f"RELEVANT SESSION VECTOR MEMORIES:\n{memory_text}\n\n"
+            f"RELEVANT REVIEWABLE CONTEXT THREADS:\n{card_context}\n\n"
             f"LATEST USER MESSAGE:\n{query[:2500]}\n\n"
             f"LATEST ASSISTANT ANSWER:\n{answer[:6000]}"
         )
@@ -436,6 +771,17 @@ class ObserverAgent:
         if not isinstance(user_profile, str) or not isinstance(context_summary, str):
             raise ValueError("The Observer returned an invalid session memory.")
         self.store.update_context(user_id, session_id, user_profile, context_summary)
+        raw_context_card = extracted.get("context_card", {})
+        context_card = (
+            self.store.store_context_card(
+                user_id,
+                session_id,
+                raw_context_card,
+                query,
+            )
+            if isinstance(raw_context_card, dict)
+            else None
+        )
         research_query = _safe_search_query(extracted.get("research_query", ""))
 
         insight_prompt = (
@@ -449,6 +795,7 @@ class ObserverAgent:
             f"USER PROFILE:\n{user_profile[:1200]}\n\n"
             f"CURRENT SESSION CONTEXT:\n{context_summary[:2000]}\n\n"
             f"RELEVANT SESSION MEMORIES:\n{memory_text}\n\n"
+            f"RELEVANT CONTEXT THREADS:\n{card_context}\n\n"
             f"LATEST USER MESSAGE:\n{query[:2500]}\n\n"
             f"LATEST ASSISTANT ANSWER:\n{answer[:6000]}"
         )
@@ -491,6 +838,9 @@ class ObserverAgent:
             "research_sources": sources,
             "research_error": search_error,
             "memories_retrieved": len(memories),
+            "context_card": context_card,
+            "context_cards": self.store.list_context_cards(user_id, session_id),
+            "relevant_context_cards": relevant_context_cards,
         }
 
     @staticmethod

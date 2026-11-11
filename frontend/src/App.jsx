@@ -15,7 +15,26 @@ import useAssistantConversation from './hooks/useAssistantConversation'
 import useSwarmStream from './hooks/useSwarmStream'
 import useObserver from './hooks/useObserver'
 import ObserverAssistant from './components/ObserverAssistant'
+import LandingPage from './components/LandingPage'
 import { stageLabels } from './constants/workflow'
+
+const CHAT_STARTERS = [
+  {
+    title: 'Untangle an idea',
+    prompt: 'Help me think through an idea and turn it into a clear plan.',
+    icon: '✳',
+  },
+  {
+    title: 'Make a plan',
+    prompt: 'Help me break my next task into practical steps.',
+    icon: '↗',
+  },
+  {
+    title: 'Explore a topic',
+    prompt: 'Explain a topic I am curious about, with useful examples.',
+    icon: '⌕',
+  },
+]
 
 function ModeTransition({ transition }) {
   if (!transition) return null
@@ -45,7 +64,7 @@ function ModeTransition({ transition }) {
   )
 }
 
-function AuthenticatedWorkspace({ token, user, onLogout }) {
+function AuthenticatedWorkspace({ token, user, onLogout, onShowLanding }) {
   const [activePage, setActivePage] = useState('chat')
   const [query, setQuery] = useState('')
   const [attachments, setAttachments] = useState([])
@@ -78,7 +97,7 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
   })
   const assistantConversation = useAssistantConversation({
     token,
-    active: activePage === 'assistant',
+    active: assistantMode && activePage === 'chat',
   })
   const hasUserMessages = messages.some((message) => message.role === 'user')
 
@@ -187,14 +206,13 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
     setAssistantMode(enabled)
     setVoiceState('idle')
     if (enabled) assistantConversation.reopenSession()
-    setActivePage(enabled ? 'assistant' : 'chat')
+    if (activePage === 'contextGraph') setActivePage('chat')
   }
 
   const handleBackToChat = () => {
-    if (activePage !== 'chat') showModeTransition('chat')
+    if (assistantMode) showModeTransition('chat')
     setAssistantMode(false)
     setVoiceState('idle')
-    setActivePage('chat')
   }
 
   const handleShowContextGraph = () => {
@@ -210,65 +228,6 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
     setAttachmentError('')
   }
 
-  if (activePage === 'assistant') {
-    return (
-      <>
-        <ModeTransition transition={modeTransition} />
-        <AssistantWorkspace
-          user={user}
-          isLoading={assistantConversation.isLoading}
-          isRunning={assistantConversation.isSending || assistantConversation.isProactive}
-          isProactive={assistantConversation.isProactive}
-          proactiveEnabled={assistantConversation.proactiveEnabled}
-          onToggleProactive={assistantConversation.toggleProactive}
-          assistantName={assistantConversation.assistantName}
-          emotionalAssistantEnabled={assistantConversation.emotionalAssistantEnabled}
-          onSavePreferences={assistantConversation.savePreferences}
-          messages={assistantConversation.messages}
-          error={assistantConversation.error}
-          memoryTurnCount={assistantConversation.memoryTurnCount}
-          query={query}
-          setQuery={setQuery}
-          attachments={attachments}
-          attachmentError={attachmentError}
-          voiceState={voiceState}
-          setVoiceState={setVoiceState}
-          onBackToChat={handleBackToChat}
-          onShowContextGraph={handleShowContextGraph}
-          onShowHistory={() => setHistoryOpen(true)}
-          onLogout={onLogout}
-          onSubmit={(event) => {
-            event.preventDefault()
-            assistantConversation.sendMessage(query, attachments)
-            setQuery('')
-            attachments.forEach(({ previewUrl }) => previewUrl && URL.revokeObjectURL(previewUrl))
-            setAttachments([])
-            setAttachmentError('')
-          }}
-          onClearMemory={assistantConversation.clearMemory}
-          onAddFiles={handleAddFiles}
-          onRemoveFile={(id) => {
-            const attachment = attachments.find((item) => item.id === id)
-            if (attachment?.previewUrl) URL.revokeObjectURL(attachment.previewUrl)
-            setAttachments((current) => current.filter((item) => item.id !== id))
-          }}
-          onVoiceSubmit={(transcript) => assistantConversation.sendMessage(transcript)}
-        />
-        <ChatHistoryDrawer
-          token={token}
-          open={historyOpen}
-          onClose={() => setHistoryOpen(false)}
-          onCleared={handleHistoryCleared}
-          isBusy={isRunning || assistantConversation.isSending}
-          onSelectPrompt={(prompt) => {
-            setQuery(prompt)
-            setHistoryOpen(false)
-          }}
-        />
-      </>
-    )
-  }
-
   return (
     <div className="chat-shell">
       <ModeTransition transition={modeTransition} />
@@ -282,11 +241,12 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
         onShowContextGraph={handleShowContextGraph}
         onBackToChat={handleBackToChat}
         onNewTask={handleNewTask}
+        onShowLanding={onShowLanding}
       />
 
-      <main className={`chat-main ${activePage === 'contextGraph' ? 'context-graph-open' : ''} ${hasUserMessages ? 'has-conversation' : 'empty-chat'}`}>
+      <main className={`chat-main ${assistantMode ? 'assistant-mode-shell' : ''} ${activePage === 'contextGraph' ? 'context-graph-open' : ''} ${hasUserMessages ? 'has-conversation' : 'empty-chat'}`}>
         <ChatHeader
-          activePage={activePage}
+          activePage={assistantMode ? 'assistant' : activePage}
           assistantMode={assistantMode}
           onAssistantModeChange={handleModeChange}
           researchMode={researchMode}
@@ -299,10 +259,73 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
         />
 
         <div className={`chat-workspace ${assistantMode ? 'assistant-mode' : ''}`} hidden={activePage === 'contextGraph'}>
+          {assistantMode ? (
+            <div key="assistant-mode" className="workspace-mode-transition">
+              <AssistantWorkspace
+                embedded
+                user={user}
+                isLoading={assistantConversation.isLoading}
+                isRunning={assistantConversation.isSending || assistantConversation.isProactive}
+                isProactive={assistantConversation.isProactive}
+                proactiveEnabled={assistantConversation.proactiveEnabled}
+                onToggleProactive={assistantConversation.toggleProactive}
+                assistantName={assistantConversation.assistantName}
+                emotionalAssistantEnabled={assistantConversation.emotionalAssistantEnabled}
+                onSavePreferences={assistantConversation.savePreferences}
+                messages={assistantConversation.messages}
+                error={assistantConversation.error}
+                memoryTurnCount={assistantConversation.memoryTurnCount}
+                query={query}
+                setQuery={setQuery}
+                attachments={attachments}
+                attachmentError={attachmentError}
+                voiceState={voiceState}
+                setVoiceState={setVoiceState}
+                onShowContextGraph={handleShowContextGraph}
+                onShowHistory={() => setHistoryOpen(true)}
+                onLogout={onLogout}
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  assistantConversation.sendMessage(query, attachments)
+                  setQuery('')
+                  attachments.forEach(({ previewUrl }) => previewUrl && URL.revokeObjectURL(previewUrl))
+                  setAttachments([])
+                  setAttachmentError('')
+                }}
+                onClearMemory={assistantConversation.clearMemory}
+                onAddFiles={handleAddFiles}
+                onRemoveFile={(id) => {
+                  const attachment = attachments.find((item) => item.id === id)
+                  if (attachment?.previewUrl) URL.revokeObjectURL(attachment.previewUrl)
+                  setAttachments((current) => current.filter((item) => item.id !== id))
+                }}
+                onVoiceSubmit={(transcript) => assistantConversation.sendMessage(transcript)}
+              />
+            </div>
+          ) : (
+            <div key="chat-mode" className="workspace-mode-transition">
             {hasUserMessages ? null : (
               <div className="empty-chat-greeting" aria-label="Welcome">
-                <span className="empty-chat-eyebrow">YOUR WORKSPACE</span>
-                <h1><TypingText text="Welcome back. What would you like to explore?" speed={28} /></h1>
+                <span className="empty-chat-eyebrow"><i aria-hidden="true" /> YOUR WORKSPACE</span>
+                <h1><TypingText text="What’s on your mind?" speed={38} /></h1>
+                <p>Bring a question, a half-formed idea, or a task. We’ll work it through together.</p>
+                <div className="chat-starter-grid" role="group" aria-label="Conversation starters">
+                  {CHAT_STARTERS.map(({ title, prompt, icon }) => (
+                    <button
+                      className="chat-starter-card"
+                      key={title}
+                      type="button"
+                      onClick={() => setQuery(prompt)}
+                    >
+                      <span className="chat-starter-icon" aria-hidden="true">{icon}</span>
+                      <span className="chat-starter-copy">
+                        <strong>{title}</strong>
+                        <small>{prompt}</small>
+                      </span>
+                      <span className="chat-starter-arrow" aria-hidden="true">↗</span>
+                    </button>
+                  ))}
+                </div>
               </div>
             )}
 
@@ -336,10 +359,20 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
               }}
               onSubmit={handleSubmit}
             />
-
+            </div>
+          )}
         </div>
 
-        {activePage === 'contextGraph' ? <ContextGraphPage token={token} isRunning={isRunning} /> : null}
+        {activePage === 'contextGraph' ? (
+          <ContextGraphPage
+            token={token}
+            isRunning={isRunning}
+            onUsePrompt={(prompt) => {
+              setQuery(prompt)
+              setActivePage('chat')
+            }}
+          />
+        ) : null}
       </main>
       {documentReviewerOpen && researchMode && activePage === 'chat' ? (
         <DocumentReviewer
@@ -351,11 +384,14 @@ function AuthenticatedWorkspace({ token, user, onLogout }) {
           onClose={() => setDocumentReviewerOpen(false)}
         />
       ) : null}
-      {(observer.enabled || observer.error) && activePage === 'chat' ? (
+      {(observer.enabled || observer.error) && activePage === 'chat' && !assistantMode ? (
         <ObserverAssistant
           result={observer.result}
           error={observer.error}
           isObserving={observer.isObserving}
+          contextCards={observer.contextCards}
+          onUpdateContextCard={observer.updateContextCard}
+          onDeleteContextCard={observer.deleteContextCard}
         />
       ) : null}
       <ChatHistoryDrawer
@@ -384,11 +420,21 @@ function App() {
     authenticateWithGoogle,
     logout,
   } = useAuth()
+  const [showLanding, setShowLanding] = useState(true)
+  const [showAuthenticatedLanding, setShowAuthenticatedLanding] = useState(false)
 
   if (isLoading) {
     return <main className="auth-loading" aria-label="Loading account">Checking your session...</main>
   }
   if (!user) {
+    if (showLanding) {
+      return (
+        <LandingPage
+          onGetStarted={() => setShowLanding(false)}
+          onSignIn={() => setShowLanding(false)}
+        />
+      )
+    }
     return (
       <AuthScreen
         onLogin={login}
@@ -398,7 +444,23 @@ function App() {
     )
   }
 
-  return <AuthenticatedWorkspace token={token} user={user} onLogout={logout} />
+  if (showAuthenticatedLanding) {
+    return (
+      <LandingPage
+        onGetStarted={() => setShowAuthenticatedLanding(false)}
+        onSignIn={() => setShowAuthenticatedLanding(false)}
+      />
+    )
+  }
+
+  return (
+    <AuthenticatedWorkspace
+      token={token}
+      user={user}
+      onLogout={logout}
+      onShowLanding={() => setShowAuthenticatedLanding(true)}
+    />
+  )
 }
 
 export default App

@@ -35,9 +35,9 @@ function getSessionId(token) {
   return createSessionId(storageKey)
 }
 
-async function observerRequest(path, token, body) {
+async function observerRequest(path, token, body, method = 'POST') {
   const response = await fetch(path, {
-    method: 'POST',
+    method,
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${token}`,
@@ -64,6 +64,7 @@ export default function useObserver({ token }) {
     }
   })
   const [result, setResult] = useState(null)
+  const [contextCards, setContextCards] = useState([])
   const [error, setError] = useState('')
   const requestGeneration = useRef(0)
 
@@ -79,6 +80,7 @@ export default function useObserver({ token }) {
         requestGeneration.current += 1
         setEnabled(false)
         setResult(null)
+        setContextCards([])
       } else {
         const activeSessionId = sessionId || createSessionId(storageKey)
         const payload = await observerRequest('/api/observer/session', token, {
@@ -91,6 +93,7 @@ export default function useObserver({ token }) {
           user_profile: payload.user_profile || '',
           context_summary: payload.context_summary || '',
         })
+        setContextCards(payload.context_cards || [])
         setEnabled(true)
       }
     } catch (requestError) {
@@ -112,6 +115,7 @@ export default function useObserver({ token }) {
       })
       if (requestGeneration.current === generation) {
         setResult(payload)
+        setContextCards(payload.context_cards || [])
         setError('')
       }
     } catch (requestError) {
@@ -120,6 +124,43 @@ export default function useObserver({ token }) {
       }
     } finally {
       if (requestGeneration.current === generation) setIsObserving(false)
+    }
+  }
+
+  const updateContextCard = async (cardId, changes) => {
+    if (!sessionId) throw new Error('Observer session is unavailable.')
+    try {
+      const payload = await observerRequest(
+        `/api/observer/context-cards/${cardId}`,
+        token,
+        { session_id: sessionId, ...changes },
+        'PATCH',
+      )
+      setContextCards((cards) => cards.map((card) => (
+        card.id === cardId ? payload.context_card : card
+      )))
+      setError('')
+      return payload.context_card
+    } catch (requestError) {
+      setError(requestError.message || 'Observer context could not be updated.')
+      throw requestError
+    }
+  }
+
+  const deleteContextCard = async (cardId) => {
+    if (!sessionId) throw new Error('Observer session is unavailable.')
+    try {
+      await observerRequest(
+        `/api/observer/context-cards/${cardId}?session_id=${encodeURIComponent(sessionId)}`,
+        token,
+        undefined,
+        'DELETE',
+      )
+      setContextCards((cards) => cards.filter((card) => card.id !== cardId))
+      setError('')
+    } catch (requestError) {
+      setError(requestError.message || 'Observer context could not be deleted.')
+      throw requestError
     }
   }
 
@@ -143,6 +184,7 @@ export default function useObserver({ token }) {
     setIsPending(false)
     setIsObserving(false)
     setResult(null)
+    setContextCards([])
     setError(resetError)
   }
 
@@ -152,9 +194,12 @@ export default function useObserver({ token }) {
     isObserving,
     sessionId,
     result,
+    contextCards,
     error,
     toggle,
     observeTurn,
+    updateContextCard,
+    deleteContextCard,
     reset,
   }
 }

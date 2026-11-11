@@ -11,13 +11,14 @@ import re
 import socket
 import sqlite3
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import lru_cache
 from heapq import heappop, heappush
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterator, TypedDict
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 from langgraph.graph import END, START, StateGraph
@@ -31,7 +32,8 @@ MAX_SOURCE_CHARS = 5000
 MAX_RETRIEVED_SOURCES = 8
 MAX_SCRAPED_PAGES = 3
 MAX_PAGE_BYTES = 2_000_000
-PAGE_FETCH_TIMEOUT_SECONDS = 6.0
+PAGE_FETCH_TIMEOUT_SECONDS = 4.0
+SEARCH_FALLBACK_TIMEOUT_SECONDS = 3.0
 MAX_REDIRECTS = 3
 TOPIC_SIMILARITY_THRESHOLD = 0.72
 GRAPH_EDGE_SIMILARITY_THRESHOLD = 0.2
@@ -120,6 +122,33 @@ class _PageTextParser(HTMLParser):
             self.title_parts.append(data)
         elif not self.skip_depth:
             self.text_parts.append(data)
+
+
+class _DuckDuckGoResultParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.results: list[dict[str, str]] = []
+        self._active_result: dict[str, str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "a":
+            return
+        attributes = dict(attrs)
+        classes = (attributes.get("class") or "").split()
+        href = attributes.get("href")
+        if "result__a" not in classes or not href:
+            return
+        self._active_result = {"href": href, "title": ""}
+
+    def handle_data(self, data: str) -> None:
+        if self._active_result is not None:
+            self._active_result["title"] += data
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "a" or self._active_result is None:
+            return
+        self.results.append(self._active_result)
+        self._active_result = None
 
 
 def _is_public_source_url(value: str) -> bool:
@@ -235,26 +264,75 @@ def _normalize_duckduckgo_results(results: object) -> list[dict]:
         url = result.get("href") or result.get("url")
         if not isinstance(url, str):
             continue
+        parsed_url = urlparse(urljoin("https://html.duckduckgo.com/", url))
+        if parsed_url.hostname and parsed_url.hostname.endswith("duckduckgo.com"):
+            url = parse_qs(parsed_url.query).get("uddg", [url])[0]
         if not _is_public_source_url(url):
             continue
         title = result.get("title")
         snippet = result.get("body") or result.get("content") or ""
-        scraped_title, page_text = ("", "")
-        try:
-            scraped_title, page_text = _scrape_public_page(url)
-        except (httpx.HTTPError, OSError, ValueError) as error:
-            LOGGER.info(
-                "Could not extract public page text (%s)",
-                type(error).__name__,
-            )
-        content = page_text if len(page_text) >= 40 else snippet
-        candidates.append({
-            "title": scraped_title or title,
-            "url": url,
-            "content": content,
-            "published_date": result.get("date") or result.get("published_date") or "",
-        })
-    return _normalize_sources({"results": candidates})
+        candidates.append((url, title, snippet, result.get("date") or result.get("published_date") or ""))
+
+    if candidates:
+        with ThreadPoolExecutor(max_workers=min(len(candidates), MAX_SCRAPED_PAGES)) as executor:
+            scraped_candidates = list(executor.map(lambda item: _scrape_duckduckgo_candidate(*item), candidates))
+        return _normalize_sources({"results": scraped_candidates})
+    return []
+
+
+def _scrape_duckduckgo_candidate(
+    url: str,
+    title: object,
+    snippet: object,
+    published_date: object,
+) -> dict:
+    scraped_title, page_text = ("", "")
+    try:
+        scraped_title, page_text = _scrape_public_page(url)
+    except (httpx.HTTPError, OSError, ValueError) as error:
+        LOGGER.info("Could not extract public page text (%s)", type(error).__name__)
+    content = page_text if len(page_text) >= 40 else snippet
+    return {
+        "title": scraped_title or title,
+        "url": url,
+        "content": content,
+        "published_date": published_date,
+    }
+
+
+def _duckduckgo_html_search(query: str) -> list[dict]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; SwarmResearchBot/1.0; +public-source retrieval)",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    with httpx.Client(
+        timeout=SEARCH_FALLBACK_TIMEOUT_SECONDS,
+        follow_redirects=False,
+        trust_env=False,
+        headers=headers,
+    ) as client:
+        with client.stream(
+            "GET",
+            "https://html.duckduckgo.com/html/",
+            params={"q": query[:2000]},
+        ) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "").lower()
+            if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+                raise RuntimeError("The HTML search fallback returned a non-HTML response.")
+            body = bytearray()
+            for chunk in response.iter_bytes():
+                remaining = MAX_PAGE_BYTES - len(body)
+                body.extend(chunk[:remaining])
+                if len(chunk) > remaining or len(body) >= MAX_PAGE_BYTES:
+                    break
+            encoding = response.encoding or "utf-8"
+    parser = _DuckDuckGoResultParser()
+    parser.feed(bytes(body).decode(encoding, errors="replace"))
+    sources = _normalize_duckduckgo_results(parser.results[:MAX_SCRAPED_PAGES])
+    if not sources:
+        raise RuntimeError("The HTML search fallback returned no usable public sources.")
+    return sources
 
 
 class PersistentWebVectorGraph:
@@ -728,7 +806,14 @@ class WebDataRetrieverAgent:
                 "Primary web search failed; trying DuckDuckGo (%s)",
                 type(error).__name__,
             )
-        return {"fetched_sources": self._duckduckgo_search(state["query"])}
+        try:
+            return {"fetched_sources": self._duckduckgo_search(state["query"])}
+        except Exception as error:
+            LOGGER.warning(
+                "DuckDuckGo client failed; trying bounded HTML scraping (%s)",
+                type(error).__name__,
+            )
+        return {"fetched_sources": _duckduckgo_html_search(state["query"])}
 
     def search_public_sources(
         self,
@@ -826,4 +911,3 @@ def format_research_context(sources: list[dict]) -> str:
         for index, source in enumerate(sources, start=1)
     )
     return f"RETRIEVAL NOTE: {warning}\n\n{context}" if warning else context
-

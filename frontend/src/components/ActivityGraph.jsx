@@ -50,6 +50,33 @@ function createLayout(graph, expandedConversationId) {
   return [...positionedQueries, ...positionedStages]
 }
 
+function createNeuralConnections(nodes, edges) {
+  const queryNodes = nodes.filter((node) => node.kind === 'query')
+  const visiblePairs = new Set(
+    edges.map((edge) => [edge.source, edge.target].sort().join(':')),
+  )
+  const connections = new Map()
+
+  queryNodes.forEach((node) => {
+    queryNodes
+      .filter((candidate) => candidate.id !== node.id)
+      .sort((left, right) => (
+        Math.hypot(left.x - node.x, left.y - node.y)
+        - Math.hypot(right.x - node.x, right.y - node.y)
+      ))
+      .slice(0, 2)
+      .forEach((neighbor) => {
+        const key = [node.id, neighbor.id].sort().join(':')
+        if (!visiblePairs.has(key)) connections.set(key, [node, neighbor])
+      })
+  })
+
+  return [...connections.entries()].map(([id, [source, target]]) => ({
+    id: `neural:${id}`,
+    path: `M ${source.x} ${source.y} L ${target.x} ${target.y}`,
+  }))
+}
+
 function getNodeColor(node) {
   if (node.kind === 'stage') return '#a3a3a3'
   if (node.cache_hit) return '#f5f5f5'
@@ -57,10 +84,15 @@ function getNodeColor(node) {
   return '#ffffff'
 }
 
-export default function ActivityGraph({ token, isRunning }) {
+export default function ActivityGraph({ token, isRunning, onUsePrompt }) {
   const [graphState, setGraphState] = useState({ graph: EMPTY_GRAPH, loading: true, error: '' })
   const [selectedItem, setSelectedItem] = useState(null)
   const [selectedConversationId, setSelectedConversationId] = useState(null)
+  const [searchText, setSearchText] = useState('')
+  const [nodeFilter, setNodeFilter] = useState('all')
+  const [showStages, setShowStages] = useState(true)
+  const [refreshVersion, setRefreshVersion] = useState(0)
+  const [refreshedAt, setRefreshedAt] = useState(null)
 
   useEffect(() => {
     const controller = new AbortController()
@@ -77,6 +109,9 @@ export default function ActivityGraph({ token, isRunning }) {
           return payload
         })
         .then((graph) => {
+          if (!Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) {
+            throw new Error('The activity graph response is incomplete.')
+          }
           const latestConversation = graph.nodes
             .filter((node) => node.kind === 'query')
             .at(-1)
@@ -86,6 +121,7 @@ export default function ActivityGraph({ token, isRunning }) {
             ))
           }
           setGraphState({ graph, loading: false, error: '' })
+          setRefreshedAt(Date.now())
         })
         .catch((error) => {
           if (error.name !== 'AbortError') {
@@ -105,20 +141,51 @@ export default function ActivityGraph({ token, isRunning }) {
       controller.abort()
       clearTimeout(refreshTimer)
     }
-  }, [token, isRunning])
+  }, [token, isRunning, refreshVersion])
 
+  const normalizedSearch = searchText.trim().toLowerCase()
+  const visibleQueryNodes = graphState.graph.nodes.filter((node) => {
+    if (node.kind !== 'query') return false
+    if (nodeFilter === 'attachments' && node.attachment_count === 0) return false
+    if (nodeFilter === 'cached' && !node.cache_hit) return false
+    return !normalizedSearch || node.query.toLowerCase().includes(normalizedSearch)
+  })
+  const visibleQueryIds = new Set(visibleQueryNodes.map((node) => node.id))
   const activeQueryId = graphState.graph.nodes
     .filter((node) => node.kind === 'query')
     .at(-1)?.id
   const expandedConversationId = isRunning ? activeQueryId : selectedConversationId
-  const nodes = createLayout(graphState.graph, expandedConversationId)
+  const visibleNodes = [
+    ...visibleQueryNodes,
+    ...(showStages
+      ? graphState.graph.nodes.filter(
+          (node) => node.kind === 'stage' && node.parent_id === expandedConversationId,
+        )
+      : []),
+  ]
+  const visibleEdges = graphState.graph.edges.filter((edge) => (
+    edge.kind === 'related'
+      ? visibleQueryIds.has(edge.source) && visibleQueryIds.has(edge.target)
+      : showStages && edge.source === expandedConversationId && visibleQueryIds.has(edge.source)
+  ))
+  const nodes = createLayout({ nodes: visibleNodes }, expandedConversationId)
+  const neuralConnections = createNeuralConnections(nodes, visibleEdges)
   const nodesById = Object.fromEntries(nodes.map((node) => [node.id, node]))
   const activeNode = selectedItem?.type === 'node' ? nodesById[selectedItem.id] : null
   const activeEdge = selectedItem?.type === 'edge'
-    ? graphState.graph.edges.find((edge) => edge.id === selectedItem.id)
+    ? visibleEdges.find((edge) => edge.id === selectedItem.id)
     : null
   const sourceNode = activeEdge ? nodesById[activeEdge.source] : null
   const targetNode = activeEdge ? nodesById[activeEdge.target] : null
+  const selectedPrompt = activeNode?.kind === 'query'
+    ? activeNode
+    : activeNode?.kind === 'stage'
+      ? graphState.graph.nodes.find((node) => node.id === activeNode.parent_id)
+      : sourceNode?.kind === 'query'
+        ? sourceNode
+        : targetNode?.kind === 'query'
+          ? targetNode
+          : null
 
   const selectConversation = (node) => {
     const conversation = node?.kind === 'query' ? node : nodesById[node?.parent_id]
@@ -133,7 +200,8 @@ export default function ActivityGraph({ token, isRunning }) {
           <p className="activity-summary">
             {graphState.loading
               ? 'Loading your prompt network...'
-              : `Showing ${graphState.graph.shown} of ${graphState.graph.total} prompts · ${graphState.graph.stage_shown} of ${graphState.graph.stage_total} agent stages · ${graphState.graph.connections} connections`}
+              : `Showing ${visibleQueryNodes.length} of ${graphState.graph.shown} prompts · ${visibleEdges.length} connections`}
+            {refreshedAt ? ` · Updated ${new Date(refreshedAt).toLocaleTimeString()}` : ''}
           </p>
         </div>
         <div className="activity-legend" aria-label="Node types">
@@ -144,16 +212,69 @@ export default function ActivityGraph({ token, isRunning }) {
         </div>
       </div>
 
+      <div className="activity-toolbar" aria-label="Graph controls">
+        <label className="activity-search">
+          <span className="activity-control-icon" aria-hidden="true">⌕</span>
+          <input
+            type="search"
+            value={searchText}
+            onChange={(event) => setSearchText(event.target.value)}
+            placeholder="Search prompts"
+            aria-label="Search prompts"
+          />
+          {searchText ? (
+            <button type="button" onClick={() => setSearchText('')} aria-label="Clear prompt search">
+              ×
+            </button>
+          ) : null}
+        </label>
+        <label className="activity-filter">
+          <span>Show</span>
+          <select
+            value={nodeFilter}
+            onChange={(event) => setNodeFilter(event.target.value)}
+            aria-label="Filter prompt nodes"
+          >
+            <option value="all">All prompts</option>
+            <option value="attachments">With files</option>
+            <option value="cached">Cached</option>
+          </select>
+        </label>
+        <label className="activity-stage-toggle">
+          <input
+            type="checkbox"
+            checked={showStages}
+            onChange={(event) => setShowStages(event.target.checked)}
+          />
+          <span>Agent stages</span>
+        </label>
+        <button
+          className="activity-refresh"
+          type="button"
+          onClick={() => setRefreshVersion((version) => version + 1)}
+          disabled={graphState.loading}
+        >
+          <span aria-hidden="true">↻</span>
+          Refresh
+        </button>
+      </div>
+
       {graphState.error ? (
         <p className="activity-empty" role="alert">{graphState.error}</p>
       ) : graphState.loading ? (
         <div className="activity-loading" aria-label="Loading activity graph" />
       ) : graphState.graph.nodes.length === 0 ? (
         <div className="activity-empty">Your prompts will form connections here as you use Swarm AI.</div>
+      ) : visibleQueryNodes.length === 0 ? (
+        <div className="activity-empty">No prompts match these filters. Try another search or filter.</div>
       ) : (
         <>
           <div className={`activity-canvas ${expandedConversationId ? 'conversation-expanded' : ''}`}>
-            <svg
+        <div className={`activity-signal-status ${isRunning ? 'live' : ''}`} aria-hidden="true">
+          <i />
+          <span>{isRunning ? 'Live workflow' : 'Signal flow'}</span>
+        </div>
+        <svg
               viewBox="0 0 1000 430"
               preserveAspectRatio="xMidYMid meet"
               role="img"
@@ -171,12 +292,35 @@ export default function ActivityGraph({ token, isRunning }) {
               <path className="brain-outline" d="M499 83 C453 44 378 50 351 91 C294 74 241 112 250 163 C211 197 230 253 268 273 C262 322 310 350 352 330 C385 369 445 350 470 320 C486 301 494 272 499 248 C504 272 512 301 530 320 C555 350 615 369 648 330 C690 350 738 322 732 273 C770 253 789 197 750 163 C759 112 706 74 649 91 C622 50 547 44 501 83 Z" />
               <path className="brain-fold" d="M500 84 C493 128 507 166 499 208 C493 243 504 278 500 319" />
 
-              {graphState.graph.edges.map((edge, index) => {
+              <g className="activity-neural-network" aria-hidden="true">
+                {neuralConnections.map((connection, index) => (
+                  <g key={connection.id}>
+                    <path
+                      id={connection.id}
+                      className="activity-neural-connection"
+                      d={connection.path}
+                    />
+                    <circle className="activity-neural-pulse" r="2">
+                      <animateMotion
+                        dur="4.8s"
+                        begin={`-${(index % 9) * 0.53}s`}
+                        repeatCount="indefinite"
+                        calcMode="paced"
+                      >
+                        <mpath href={`#${connection.id}`} />
+                      </animateMotion>
+                    </circle>
+                  </g>
+                ))}
+              </g>
+
+              {visibleEdges.map((edge, index) => {
                 const source = nodesById[edge.source]
                 const target = nodesById[edge.target]
                 if (!source || !target) return null
                 const path = `M ${source.x} ${source.y} L ${target.x} ${target.y}`
                 const isLiveSignal = isRunning && edge.kind === 'stage' && edge.source === activeQueryId
+                const hasNeuralSignal = edge.kind === 'related' || isLiveSignal
                 const pathId = `activity-edge-path-${index}`
                 return (
                   <g key={edge.id}>
@@ -197,16 +341,16 @@ export default function ActivityGraph({ token, isRunning }) {
                     />
                     <path
                       id={pathId}
-                      className={`activity-edge ${isLiveSignal ? 'live' : ''} ${selectedItem?.type === 'edge' && selectedItem.id === edge.id ? 'selected' : ''}`}
+                      className={`activity-edge ${edge.kind === 'related' ? 'neural' : ''} ${isLiveSignal ? 'live' : ''} ${selectedItem?.type === 'edge' && selectedItem.id === edge.id ? 'selected' : ''}`}
                       d={path}
                       strokeWidth={1 + edge.similarity * 2}
                       pointerEvents="none"
                     />
-                    {isLiveSignal && Array.from({ length: 2 }, (_, signalIndex) => (
-                      <circle className="activity-signal" key={signalIndex} r="3.5">
+                    {hasNeuralSignal && Array.from({ length: isLiveSignal ? 2 : 1 }, (_, signalIndex) => (
+                      <circle className={`activity-signal ${isLiveSignal ? 'live' : 'ambient'}`} key={signalIndex} r={isLiveSignal ? 3.5 : 2.5}>
                         <animateMotion
-                          dur="1.7s"
-                          begin={`-${signalIndex * 0.85 + (index % 3) * 0.2}s`}
+                          dur={isLiveSignal ? '1.7s' : '5.2s'}
+                          begin={`-${signalIndex * 0.85 + (index % 7) * (isLiveSignal ? 0.2 : 0.48)}s`}
                           repeatCount="indefinite"
                           calcMode="paced"
                         >
@@ -218,9 +362,10 @@ export default function ActivityGraph({ token, isRunning }) {
                 )
               })}
 
-              {nodes.map((node) => (
+              {nodes.map((node, index) => (
                 <g
                   className={`activity-node ${node.kind === 'query' ? 'query-node' : 'stage-node'} ${selectedItem?.type === 'node' && selectedItem.id === node.id ? 'selected' : ''}`}
+                  style={{ '--neural-delay': `${(index % 8) * 260}ms` }}
                   key={node.id}
                   tabIndex={0}
                   role="button"
@@ -256,6 +401,15 @@ export default function ActivityGraph({ token, isRunning }) {
                 <span>{activeNode.kind === 'stage'
                   ? `For: ${activeNode.parent_query} · ${formatTimestamp(activeNode.created_at)}`
                   : `${formatTimestamp(activeNode.created_at)} · ${activeNode.attachment_count} attachments${activeNode.cache_hit ? ' · answered from cache' : ''}`}</span>
+                {selectedPrompt ? (
+                  <button
+                    className="activity-use-prompt"
+                    type="button"
+                    onClick={() => onUsePrompt?.(selectedPrompt.query)}
+                  >
+                    Use in chat
+                  </button>
+                ) : null}
               </>
             ) : activeEdge && sourceNode && targetNode ? (
               <>
@@ -267,6 +421,15 @@ export default function ActivityGraph({ token, isRunning }) {
                 <p>{sourceNode.query}</p>
                 <p>{activeEdge.kind === 'stage' ? targetNode.output : targetNode.query}</p>
                 <span>{activeEdge.context}</span>
+                {selectedPrompt ? (
+                  <button
+                    className="activity-use-prompt"
+                    type="button"
+                    onClick={() => onUsePrompt?.(selectedPrompt.query)}
+                  >
+                    Use in chat
+                  </button>
+                ) : null}
               </>
             ) : (
               <span>Select a prompt to expand its agent stages and inspect the conversation details below.</span>

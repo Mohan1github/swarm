@@ -5,12 +5,20 @@ export default function ChatSidebar({
   onShowContextGraph,
   onBackToChat,
   onNewTask,
+  onShowLanding,
 }) {
   return (
     <aside className="chat-sidebar">
       <div className="brand-block">
         <div className="brand-row">
-          <div className="brand-mark">AI</div>
+          <button
+            type="button"
+            className="sidebar-brand-button"
+            onClick={onShowLanding}
+            aria-label="Open Swarm AI landing page"
+          >
+            <div className="brand-mark">AI</div>
+          </button>
           <div>
             <h1>Swarm AI</h1>
           </div>

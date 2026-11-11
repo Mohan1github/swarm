@@ -180,6 +180,15 @@ class ObserverTurnRequest(ObserverSessionRequest):
     answer: str = Field(..., min_length=1, max_length=6000)
 
 
+class ObserverContextCardUpdateRequest(ObserverSessionRequest):
+    topic: str | None = Field(default=None, max_length=180)
+    goal: str | None = Field(default=None, max_length=600)
+    decisions: list[str] | None = Field(default=None, max_length=5)
+    open_questions: list[str] | None = Field(default=None, max_length=5)
+    next_step: str | None = Field(default=None, max_length=500)
+    pinned: bool | None = None
+
+
 class QueryResponse(BaseModel):
     status: str
     mode: str
@@ -348,7 +357,7 @@ def _attach_evidence_ledger(workflow: dict, user_id: int, query: str, llm) -> No
     sources = workflow.pop("retrieved_sources", [])
     if (
         not (workflow.get("route") or {}).get("requires_web_search")
-        or workflow.get("fallback_mode") == "public_sources"
+        or workflow.get("fallback_mode") in {"public_sources", "normal_gateway"}
     ):
         return
     try:
@@ -614,6 +623,7 @@ def google_login(payload: GoogleCredentialRequest) -> AuthResponse:
             payload.nonce,
         )
     except HTTPException:
+        
         raise
     except ValueError as error:
         raise HTTPException(
@@ -708,7 +718,14 @@ def start_observer_session(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Could not start Observer mode. Please retry.",
         ) from error
-    return {"enabled": True, **profile}
+    return {
+        "enabled": True,
+        **profile,
+        "context_cards": OBSERVER_AGENT.store.list_context_cards(
+            current_user.id,
+            str(payload.session_id),
+        ),
+    }
 
 
 @app.post("/api/observer/session/stop")
@@ -744,6 +761,75 @@ def observe_chat_turn(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Observer could not update its session context.",
         ) from error
+
+
+@app.get("/api/observer/context-cards")
+def list_observer_context_cards(
+    session_id: UUID = Query(...),
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict:
+    if not OBSERVER_AGENT.store.get_session(current_user.id, str(session_id)):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Observer session was not found.",
+        )
+    return {
+        "context_cards": OBSERVER_AGENT.store.list_context_cards(
+            current_user.id,
+            str(session_id),
+        ),
+    }
+
+
+@app.patch("/api/observer/context-cards/{card_id}")
+def update_observer_context_card(
+    card_id: int,
+    payload: ObserverContextCardUpdateRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict:
+    changes = payload.model_dump(exclude={"session_id"}, exclude_unset=True)
+    if not changes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Provide at least one context-card field to update.",
+        )
+    try:
+        card = OBSERVER_AGENT.store.update_context_card(
+            current_user.id,
+            str(payload.session_id),
+            card_id,
+            changes,
+        )
+    except KeyError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Observer context card was not found.",
+        ) from error
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(error),
+        ) from error
+    return {"context_card": card}
+
+
+@app.delete("/api/observer/context-cards/{card_id}")
+def delete_observer_context_card(
+    card_id: int,
+    session_id: UUID = Query(...),
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict:
+    deleted = OBSERVER_AGENT.store.delete_context_card(
+        current_user.id,
+        str(session_id),
+        card_id,
+    )
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Observer context card was not found.",
+        )
+    return {"deleted": True, "card_id": card_id}
 
 
 @app.get("/api/assistant/preferences")
@@ -870,6 +956,11 @@ def stream_assistant_session(
 def stream_assistant_proactive_turn(
     current_user: AuthUser = Depends(get_current_user),
 ) -> StreamingResponse:
+    if not ASSISTANT_MEMORY.load_preferences(current_user.id)["proactive_enabled"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Proactive follow-ups are disabled for this account.",
+        )
     llm = build_llm_adapter()
     if not llm.enabled:
         raise HTTPException(status_code=503, detail="Live LLM is not configured.")
@@ -879,10 +970,14 @@ def stream_assistant_proactive_turn(
             turns, _ = ASSISTANT_MEMORY.load(current_user.id)
             memory_context = _assistant_memory_context(current_user.id, turns)
             activity_context = ASSISTANT_MEMORY.load_workspace_context(current_user.id)
+            vector_context = "\n".join(
+                ASSISTANT_MEMORY.retrieve_proactive_context(current_user.id)
+            )
             response = ""
             for chunk in ProactiveConversationAgent(llm).stream_follow_up(
                 memory_context,
                 activity_context,
+                vector_context,
             ):
                 if not isinstance(chunk, str) or not chunk:
                     continue
@@ -1161,7 +1256,7 @@ def _prepare_attachments(attachments: list[AttachmentRequest]) -> tuple[str, lis
         }
         if extension in document_media_types:
             media_type = document_media_types[extension]
-            if attachment.media_type != media_type:
+            if attachment.media_type != media_type: 
                 raise HTTPException(
                     status_code=415,
                     detail=f"Unsupported document type for {attachment.name}.",
@@ -1369,7 +1464,6 @@ def stream_swarm_query(payload: QueryRequest,_current_user: AuthUser = Depends(g
         conversation_history=payload.conversation_history,
     )
 
-
 @app.get("/api/swarm/query/stream")
 def stream_swarm_query_get(
     query: str = Query(..., min_length=1, max_length=2000),
@@ -1377,7 +1471,6 @@ def stream_swarm_query_get(
     _current_user: AuthUser = Depends(get_current_user),
 ) -> StreamingResponse:
     return _stream_workflow(query, total_agents, _current_user.id)
-
 
 @app.get("/")
 def index() -> dict:

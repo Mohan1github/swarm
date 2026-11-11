@@ -19,7 +19,6 @@ export default function AssistantWorkspace({
   attachmentError,
   voiceState,
   setVoiceState,
-  onBackToChat,
   onShowContextGraph,
   onShowHistory,
   onLogout,
@@ -31,6 +30,7 @@ export default function AssistantWorkspace({
   assistantName,
   emotionalAssistantEnabled,
   onSavePreferences,
+  embedded = false,
 }) {
   const [speechProgress, setSpeechProgress] = useState(0)
   const [nameDraft, setNameDraft] = useState(assistantName)
@@ -91,8 +91,10 @@ export default function AssistantWorkspace({
   }
 
 
+  const WorkspaceRoot = embedded ? 'section' : 'main'
+
   return (
-    <main className="assistant-page">
+    <WorkspaceRoot className={`assistant-page ${embedded ? 'assistant-page-embedded' : ''}`}>
       <header className="assistant-page-header">
         <div className="assistant-page-brand">
           <span className="assistant-brand-mark" aria-hidden="true">S</span>
@@ -139,7 +141,6 @@ export default function AssistantWorkspace({
                 <button type="button" role="menuitem" onClick={() => runMenuAction(onShowHistory)}>History</button>
                 <button type="button" role="menuitem" onClick={() => runMenuAction(onShowContextGraph)}>Context graph</button>
                 <button type="button" role="menuitem" onClick={() => runMenuAction(onClearMemory)}>Forget memory</button>
-                <button type="button" role="menuitem" onClick={() => runMenuAction(onBackToChat)}>Back to chat</button>
                 <button type="button" role="menuitem" onClick={() => runMenuAction(onLogout)} title={user.email}>Sign out</button>
               </div>
             ) : null}
@@ -191,7 +192,7 @@ export default function AssistantWorkspace({
       ) : null}
 
 
-      <div className="assistant-page-body">
+      <div className={`assistant-page-body ${embedded ? 'assistant-live-space' : ''}`}>
         <section className="assistant-presence-stage" aria-label="Live assistant">
           <span className="assistant-stage-kicker">A little space to think</span>
           <AssistantPresence
@@ -211,11 +212,11 @@ export default function AssistantWorkspace({
           </p>
         </section>
 
-        <section className="assistant-conversation" aria-label="Assistant conversation">
+        <section className="assistant-conversation assistant-live-thread" aria-label="Assistant conversation">
           <header className="assistant-conversation-header">
             <div>
-              <span>PRIVATE WORKSPACE</span>
-              <h1>Your conversation</h1>
+              <span>LIVE THREAD</span>
+              <h1>Conversation</h1>
             </div>
             <div className="assistant-conversation-header-actions">
               <span className="assistant-context-indicator">
@@ -246,6 +247,6 @@ export default function AssistantWorkspace({
           />
         </section>
       </div>
-    </main>
+    </WorkspaceRoot>
   )
 }

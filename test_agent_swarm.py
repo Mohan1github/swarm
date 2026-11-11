@@ -86,6 +86,49 @@ def test_assistant_memory_is_private_and_bounded(tmp_path):
     assert bounded_turns[-1]["content"] == "Answer 24"
 
 
+def test_assistant_proactive_vector_context_ranks_recurring_threads_per_user(tmp_path):
+    memory = AssistantMemoryAccumulator(tmp_path / "assistant-proactive-vectors.sqlite3")
+    memory.remember_exchange(
+        1,
+        "Help me complete the launch rollout checklist and verify rollback steps.",
+        "Start by validating rollback readiness.",
+    )
+    memory.remember_exchange(
+        1,
+        "I need to finish the launch rollout checklist before deployment.",
+        "Let's confirm the remaining release checks.",
+    )
+    memory.remember_exchange(
+        1,
+        "Which rollback checks are still missing from the launch rollout?",
+        "Check rollback readiness before release.",
+    )
+    memory.remember_exchange(
+        1,
+        "Let's make sure the deployment rollout checklist is complete.",
+        "We can review the remaining launch tasks.",
+    )
+    memory.remember_exchange(
+        1,
+        "Can we finish the release rollout checklist?",
+        "Let's confirm the final deployment steps.",
+    )
+    memory.remember_exchange(2, "Plan a personal vacation itinerary.", "Let's compare destinations.")
+    memory.remember_exchange(
+        1,
+        "Let's continue the launch rollout checklist and verify rollback.",
+        "The rollback checks are next.",
+    )
+
+    related_threads = memory.retrieve_proactive_context(1)
+
+    assert len(related_threads) >= 1
+    assert all("launch rollout checklist" in thread.lower() for thread in related_threads)
+    assert all("similar earlier thread(s)" in thread for thread in related_threads)
+    assert all("vacation" not in thread.lower() for thread in related_threads)
+    assert memory.retrieve_proactive_context(2) == []
+
+
 def test_conversational_agent_uses_memory_for_opening_and_reply():
     prompts = []
 
@@ -144,6 +187,13 @@ def test_proactive_agent_generates_a_grounded_idle_follow_up():
     assert "Do not merely repeat your prior greeting" in prompts[0]
     assert "searched the web" in prompts[0]
     assert "not claim to have monitored the user" in prompts[0]
+    assert "concrete next task" in prompts[0]
+    assert "useful question or query" in prompts[0]
+    assert "joy, excitement" in prompts[0]
+    assert "frustration, disappointment" in prompts[0]
+    assert "when the signal is ambiguous, stay warm and neutral" in prompts[0]
+    assert "You do not experience human emotions" in prompts[0]
+    assert "do not diagnose, exaggerate, pry" in prompts[0]
 
 
 def test_assistant_streaming_routes_stream_openings_and_persist_only_completed_turns(monkeypatch, tmp_path):
@@ -252,10 +302,25 @@ def test_assistant_proactive_stream_route_uses_and_persists_private_context(monk
     assert events[-1]["memory_turn_count"] == 3
     assert "rollback checklist remains" in prompts[0]
     assert "release checklist is not finished" in prompts[0]
+    assert "RELATED USER THREADS FROM VECTOR MEMORY" in prompts[0]
     assert memory.load(TEST_USER.id)[0][-1] == {
         "role": "assistant",
         "content": "You could review the rollback checklist next.",
     }
+
+
+def test_assistant_proactive_stream_route_respects_opt_out(tmp_path, monkeypatch):
+    memory = AssistantMemoryAccumulator(tmp_path / "assistant-proactive-opt-out.sqlite3")
+    memory.save_preferences(TEST_USER.id, "Swarm Assistant", False, False)
+    monkeypatch.setattr(server, "ASSISTANT_MEMORY", memory)
+
+    try:
+        server.stream_assistant_proactive_turn(current_user=TEST_USER)
+    except server.HTTPException as error:
+        assert error.status_code == 409
+        assert "disabled" in error.detail
+    else:
+        raise AssertionError("Proactive follow-up should be blocked when disabled.")
 
 
 def test_assistant_streaming_error_does_not_persist_partial_reply(monkeypatch, tmp_path):
@@ -788,6 +853,8 @@ def test_web_retrieval_stage_is_only_added_to_reasoning_route(monkeypatch, tmp_p
 
         def generate(self, prompt, max_tokens=800, image_data_urls=None):
             prompts.append(prompt)
+            if "using the configured normal LLM gateway" in prompt:
+                return "Gateway fallback: current facts could not be verified."
             if "query level and importance finder" in prompt:
                 return json.dumps({
                     "route": "reasoning",
@@ -795,6 +862,20 @@ def test_web_retrieval_stage_is_only_added_to_reasoning_route(monkeypatch, tmp_p
                     "reason": "Needs current reporting.",
                     "requires_web_search": True,
                     "search_topic": "news",
+                })
+            if "You are a deep research query generator." in prompt:
+                return json.dumps({
+                    "clarification_needed": "",
+                    "confidence": 95,
+                    "search_queries": ["latest report"],
+                    "missing_information": [],
+                })
+            if "You are a research next-query decider." in prompt:
+                return json.dumps({
+                    "continue_research": False,
+                    "next_query": "",
+                    "confidence": 90,
+                    "reason": "The source is sufficient.",
                 })
             if "Return one JSON object" in prompt:
                 return json.dumps({
@@ -813,9 +894,16 @@ def test_web_retrieval_stage_is_only_added_to_reasoning_route(monkeypatch, tmp_p
                     "search_terms": "current report",
                 })
             if "You are the final response summarizer" in prompt:
+                if "No live sources are available." in prompt:
+                    return "I could not verify current facts from live sources."
                 return "The current report says X. Source: https://example.com/report"
             if "Return JSON only with a numeric `validation_score`" in prompt:
                 return json.dumps({"validation_score": 0.9, "issues": []})
+            if "You are an experienced, calm cognitive research partner." in prompt:
+                if "I could not verify current facts from live sources." in prompt:
+                    return "I could not verify current facts from live sources."
+                if "The current report says X. Source: https://example.com/report" in prompt:
+                    return "The current report says X. Source: https://example.com/report"
             return "The source reports current findings."
 
     monkeypatch.setattr(orchestrator_module, "WebDataRetrieverAgent", FakeRetriever)
@@ -825,14 +913,73 @@ def test_web_retrieval_stage_is_only_added_to_reasoning_route(monkeypatch, tmp_p
 
     stage_events = [event for event in events if event["type"] == "step"]
     stage_starts = [event for event in events if event["type"] == "stage_start"]
-    assert stage_events[0]["role"] == "web_retriever"
-    assert stage_starts[0]["stage_total"] == len(stage_events) == 12
-    assert "https://example.com/report" in stage_events[0]["output"]
-    assert stage_events[0]["ui_data"]["sources"][0]["title"] == "Public report"
-    assert stage_events[-1]["ui_data"]["validation_score"] == 0.9
-    assert "public-web text retrieval agent" in prompts[2]
-    assert "https://example.com/report" in prompts[2]
+    web_step = next(event for event in stage_events if event["role"] == "web_retriever")
+    validator_step = next(event for event in stage_events if event["role"] == "validator")
+    assert stage_starts[0]["role"] == "query_generator"
+    assert stage_starts[0]["stage_total"] == len(stage_events)
+    assert "https://example.com/report" in web_step["output"]
+    assert web_step["ui_data"]["sources"][0]["title"] == "Public report"
+    assert validator_step["ui_data"]["validation_score"] == 0.9
+    assert any(
+        "public-web text retrieval agent" in prompt and "https://example.com/report" in prompt
+        for prompt in prompts
+    )
     assert events[-1]["answer"].endswith("https://example.com/report")
+
+    def fail_retrieval(self, user_id, query, search_topic):
+        raise RuntimeError("all web providers unavailable")
+
+    monkeypatch.setattr(FakeRetriever, "retrieve", fail_retrieval)
+    prompts.clear()
+    fallback_engine = module.ReasoningSwarmEngine(total_agents=1)
+    fallback_engine.llm = FakeLLM()
+    fallback_events = list(
+        fallback_engine.iter_workflow("What is the latest report?", user_id=73)
+    )
+    fallback_web_step = next(
+        event
+        for event in fallback_events
+        if event["type"] == "step" and event["role"] == "web_retriever"
+    )
+    assert fallback_web_step["ui_data"]["retrieval_warning"]
+    assert fallback_web_step["ui_data"]["sources"] == []
+    assert fallback_events[-1]["type"] == "complete"
+    assert fallback_events[-1]["fallback_mode"] == "normal_gateway"
+    assert fallback_events[-1]["answer"] == (
+        "Gateway fallback: current facts could not be verified."
+    )
+    assert any("configured normal LLM gateway" in prompt for prompt in prompts)
+    assert not any(
+        event.get("role") in {"planner", "response_summarizer"}
+        for event in fallback_events
+        if event["type"] == "stage_start"
+    )
+    anonymous_events = list(
+        fallback_engine.iter_workflow("What is the latest report?")
+    )
+    assert anonymous_events[-1]["type"] == "complete"
+    assert anonymous_events[-1]["fallback_mode"] == "normal_gateway"
+    assert anonymous_events[-1]["answer"] == (
+        "Gateway fallback: current facts could not be verified."
+    )
+
+
+def test_normal_gateway_web_fallback_skips_empty_evidence_ledger(monkeypatch):
+    def unexpected_ledger(*_args, **_kwargs):
+        raise AssertionError("A source-less gateway fallback should not run an evidence audit.")
+
+    monkeypatch.setattr(server, "CitationAndTruthFinderAgent", unexpected_ledger)
+    workflow = {
+        "route": {"requires_web_search": True},
+        "fallback_mode": "normal_gateway",
+        "retrieved_sources": [],
+        "answer": "Current facts could not be verified.",
+    }
+
+    server._attach_evidence_ledger(workflow, 73, "latest report", object())
+
+    assert "evidence_ledger" not in workflow
+    assert "retrieved_sources" not in workflow
 
 
 def test_web_retrieval_without_tavily_uses_duckduckgo_fallback(monkeypatch, tmp_path):
@@ -900,6 +1047,76 @@ def test_tavily_failure_uses_duckduckgo_and_bounded_page_text(monkeypatch):
     assert len(sources) == 1
     assert sources[0]["title"] == "Extracted title"
     assert "detailed public evidence" in sources[0]["content"]
+
+
+def test_search_provider_failures_fall_back_to_bounded_html_scraper(monkeypatch):
+    class BrokenTavily:
+        def invoke(self, _payload):
+            raise RuntimeError("primary search unavailable")
+
+    class BrokenDDGS:
+        def text(self, _query, max_results):
+            assert max_results == web_retriever_module.MAX_RESULTS
+            raise RuntimeError("secondary search unavailable")
+
+    class FakeResponse:
+        headers = {"content-type": "text/html; charset=utf-8"}
+        encoding = "utf-8"
+        body = (
+            '<a class="result__a" href="//duckduckgo.com/l/?uddg='
+            'https%3A%2F%2Fexample.com%2Freport">Public report</a>'
+        ).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield self.body
+
+    class FakeClient:
+        def __init__(self, **options):
+            assert options["timeout"] == web_retriever_module.SEARCH_FALLBACK_TIMEOUT_SECONDS
+            assert options["trust_env"] is False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def stream(self, method, url, params):
+            assert method == "GET"
+            assert url == "https://html.duckduckgo.com/html/"
+            assert params["q"] == "latest public evidence"
+            return FakeResponse()
+
+    monkeypatch.setitem(sys.modules, "ddgs", SimpleNamespace(DDGS=BrokenDDGS))
+    monkeypatch.setattr(web_retriever_module.httpx, "Client", FakeClient)
+    monkeypatch.setattr(web_retriever_module, "_is_public_source_url", lambda _url: True)
+    monkeypatch.setattr(
+        web_retriever_module,
+        "_scrape_public_page",
+        lambda _url: (
+            "Extracted report",
+            "This public report contains current evidence and detailed findings. " * 2,
+        ),
+    )
+
+    sources = WebDataRetrieverAgent(search_tool=BrokenTavily())._search_text({
+        "query": "latest public evidence",
+        "search_topic": "general",
+    })["fetched_sources"]
+
+    assert len(sources) == 1
+    assert sources[0]["title"] == "Extracted report"
+    assert sources[0]["url"] == "https://example.com/report"
+    assert "current evidence" in sources[0]["content"]
 
 
 def test_public_page_scraper_extracts_text_and_blocks_local_addresses(monkeypatch):
@@ -2600,6 +2817,21 @@ def test_observer_api_session_controls_require_auth_and_are_user_scoped(tmp_path
         "query": "hello",
         "answer": "hi",
     }).status_code == 401
+    assert client.get(
+        "/api/observer/context-cards",
+        params={"session_id": "4ad7af04-f682-43d8-a181-1c29c2844ce1"},
+    ).status_code == 401
+    assert client.patch(
+        "/api/observer/context-cards/1",
+        json={
+            "session_id": "4ad7af04-f682-43d8-a181-1c29c2844ce1",
+            "pinned": True,
+        },
+    ).status_code == 401
+    assert client.delete(
+        "/api/observer/context-cards/1",
+        params={"session_id": "4ad7af04-f682-43d8-a181-1c29c2844ce1"},
+    ).status_code == 401
 
     class FakeEmbeddings:
         def embed_documents(self, texts):
@@ -2615,10 +2847,119 @@ def test_observer_api_session_controls_require_auth_and_are_user_scoped(tmp_path
         "enabled": True,
         "user_profile": "",
         "context_summary": "",
+        "context_cards": [],
     }
     assert store.is_enabled(TEST_USER.id, str(payload.session_id))
+    card = store.store_context_card(
+        TEST_USER.id,
+        str(payload.session_id),
+        {"topic": "API context", "confidence": 0.8},
+        "Keep this topic in view.",
+    )
+    assert server.list_observer_context_cards(
+        session_id=payload.session_id,
+        current_user=TEST_USER,
+    )["context_cards"][0]["id"] == card["id"]
+    updated_card = server.update_observer_context_card(
+        card_id=card["id"],
+        payload=server.ObserverContextCardUpdateRequest(
+            session_id=payload.session_id,
+            pinned=True,
+        ),
+        current_user=TEST_USER,
+    )
+    assert updated_card["context_card"]["pinned"] is True
+    assert server.delete_observer_context_card(
+        card_id=card["id"],
+        session_id=payload.session_id,
+        current_user=TEST_USER,
+    ) == {"deleted": True, "card_id": card["id"]}
     server.stop_observer_session(payload, current_user=TEST_USER)
     assert not store.is_enabled(TEST_USER.id, str(payload.session_id))
+
+
+def test_observer_context_cards_are_vectorized_editable_and_user_scoped(tmp_path):
+    class FakeEmbeddings:
+        def embed_documents(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+        def embed_query(self, text):
+            return [1.0, 0.0]
+
+    store = ObserverSessionStore(tmp_path / "observer-context-cards.sqlite3", FakeEmbeddings())
+    store.start(1, "session-a")
+    store.start(2, "session-a")
+    card = store.store_context_card(
+        1,
+        "session-a",
+        {
+            "topic": "Accessible rollout",
+            "goal": "Launch in stages",
+            "decisions": ["Start with a pilot"],
+            "open_questions": ["What is the rollback threshold?"],
+            "next_step": "Define success metrics",
+            "confidence": 0.82,
+        },
+        "We should plan an accessible rollout.",
+    )
+
+    assert card["topic"] == "Accessible rollout"
+    assert card["confidence"] == 0.82
+    assert len(store.retrieve_context_cards(1, "session-a", "rollout")) == 1
+    assert store.list_context_cards(2, "session-a") == []
+
+    updated = store.update_context_card(
+        1,
+        "session-a",
+        card["id"],
+        {"goal": "Launch with an accessible pilot", "pinned": True},
+    )
+    assert updated["goal"] == "Launch with an accessible pilot"
+    assert updated["pinned"] is True
+    assert store.delete_context_card(2, "session-a", card["id"]) is False
+    assert store.delete_context_card(1, "session-a", card["id"]) is True
+    assert store.list_context_cards(1, "session-a") == []
+
+
+def test_observer_extracts_and_returns_reviewable_context_card(tmp_path):
+    class FakeEmbeddings:
+        def embed_documents(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+        def embed_query(self, text):
+            return [1.0, 0.0]
+
+    class FakeLLM:
+        def generate(self, prompt, max_tokens=800):
+            if "Return JSON with string fields `user_profile`" in prompt:
+                return json.dumps({
+                    "user_profile": "Prefers concise summaries.",
+                    "context_summary": "Planning an accessible product rollout.",
+                    "research_query": "",
+                    "context_card": {
+                        "topic": "Accessible rollout",
+                        "goal": "Plan a staged launch",
+                        "decisions": ["Begin with a pilot"],
+                        "open_questions": ["What defines a successful pilot?"],
+                        "next_step": "Set measurable exit criteria",
+                        "confidence": 0.9,
+                    },
+                })
+            return json.dumps({"insight": "Pilot criteria need agreement.", "next_idea": ""})
+
+    store = ObserverSessionStore(tmp_path / "observer-context-agent.sqlite3", FakeEmbeddings())
+    store.start(12, "context-session")
+    result = ObserverAgent(store).observe(
+        12,
+        "context-session",
+        "Let's plan an accessible product rollout.",
+        "Start with a small pilot.",
+        FakeLLM(),
+    )
+
+    assert result["context_card"]["topic"] == "Accessible rollout"
+    assert result["context_card"]["source_excerpt"] == "Let's plan an accessible product rollout."
+    assert result["context_cards"][0]["goal"] == "Plan a staged launch"
 
 
 def test_current_and_verification_queries_bypass_answer_cache():

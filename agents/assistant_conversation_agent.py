@@ -11,6 +11,7 @@ DEFAULT_MEMORY_PATH = Path(__file__).resolve().parents[1] / "assistant_memory.sq
 MAX_STORED_TURNS = 40
 MAX_CONTEXT_TURNS = 16
 MAX_RELEVANT_VECTOR_TURNS = 6
+MAX_PROACTIVE_VECTOR_SCAN = 240
 
 
 class AssistantMemoryAccumulator:
@@ -208,6 +209,78 @@ class AssistantMemoryAccumulator:
             f"{role.upper()}: {content[:500]}"
             for similarity, role, content in scored[:limit]
             if similarity > 0.05
+        ]
+
+    def retrieve_proactive_context(
+        self,
+        user_id: int,
+        limit: int = MAX_RELEVANT_VECTOR_TURNS,
+    ) -> list[str]:
+        import json
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, role, content, vector_json
+                FROM assistant_conversation_vectors
+                WHERE user_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (user_id, MAX_PROACTIVE_VECTOR_SCAN),
+            ).fetchall()
+
+        user_rows = [row for row in rows if row["role"] == "user"]
+        recent_rows = user_rows[:4]
+        if not recent_rows:
+            return []
+
+        recent_ids = {row["id"] for row in recent_rows}
+        anchors = []
+        for row in recent_rows:
+            try:
+                anchors.append({
+                    int(index): value
+                    for index, value in json.loads(row["vector_json"]).items()
+                })
+            except (TypeError, ValueError):
+                continue
+        if not anchors:
+            return []
+
+        candidates = []
+        for row in user_rows:
+            if row["id"] in recent_ids:
+                continue
+            try:
+                vector = {
+                    int(index): value
+                    for index, value in json.loads(row["vector_json"]).items()
+                }
+            except (TypeError, ValueError):
+                continue
+            relevance = max((_cosine(anchor, vector) for anchor in anchors), default=0.0)
+            if relevance >= 0.08:
+                candidates.append({"id": row["id"], "content": row["content"], "vector": vector, "relevance": relevance})
+
+        for candidate in candidates:
+            repeats = sum(
+                1
+                for other in candidates
+                if other["id"] != candidate["id"]
+                and _cosine(candidate["vector"], other["vector"]) >= 0.34
+            )
+            candidate["repeats"] = repeats
+            candidate["score"] = candidate["relevance"] + min(repeats, 3) * 0.06
+
+        candidates.sort(key=lambda item: (item["score"], item["id"]), reverse=True)
+        return [
+            (
+                f"[topic match {item['relevance']:.2f}; "
+                f"{item['repeats']} similar earlier thread(s)] "
+                f"USER: {item['content'][:450]}"
+            )
+            for item in candidates[:max(0, limit)]
         ]
 
     def load_preferences(self, user_id: int) -> dict[str, object]:
